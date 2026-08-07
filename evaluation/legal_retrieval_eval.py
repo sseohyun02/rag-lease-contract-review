@@ -1,6 +1,29 @@
-"""법령/판례 검색 평가 — 실제 DB 임베딩 pipeline 사용."""
+"""법령/판례 검색 평가 — 실제 DB 임베딩 pipeline 사용.
+
+원본(evaluation/legal_retrieval_eval.py) 대비 차이:
+  1. recall@k를 법령/판례 타입별로 독립적으로 계산
+     (원본은 법령+판례가 뒤섞인 리스트를 통째로 [:k]로 잘라서, 판례 후보가
+     상위권을 차지하면 법령 recall이 부당하게 낮아지는 버그가 있었음)
+  2. eval_set 입력 경로와 결과 출력 경로를 CLI로 지정 가능
+     (원본은 evaluation/eval_set.json 고정이라 tune/test를 분리해서
+     따로 돌릴 수 없었음)
+  3. precision@1, MRR(Mean Reciprocal Rank) 추가
+     (recall@k만으로는 "가장 자신 있게 1등으로 뽑은 게 얼마나 정확한지"를
+     알 수 없어서 별도로 계산한다)
+
+참고: query expansion의 eval_set 힌트 주입("overfit_mode") 기능은
+pipeline/retrieval/query_expansion/query_expansion.py에서 완전히
+삭제했으므로, 이 스크립트는 그 옵션 없이 항상 정직하게 평가한다.
+
+사용 예
+-------
+    python evaluation/legal_retrieval_eval_clean.py \
+        --eval-set evaluation/eval_set_test.json \
+        --results evaluation/eval_results_test.json
+"""
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import sys
@@ -32,10 +55,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-EVAL_SET_PATH = Path(__file__).resolve().parent / "eval_set.json"
-TOP_K = 20
+TOP_K = 50   # 후보군 깊이 (recall@20 vs recall@50 비교 진단용으로 확대)
 RRF_K = 60
-RECALL_K_VALUES = [1, 3, 5, 10, 20]
+RECALL_K_VALUES = [1, 3, 5, 10, 20, 50]
 EMBED_COLS = ["embed_vertex"]
 LAW_KEEP_COLS = ["clause_key", "law_name", "article_no", "paragraph_no", "child_text"]
 PREC_KEEP_COLS = ["case_id", "case_number", "judgment_summary"]
@@ -84,12 +106,10 @@ def load_corpus() -> dict:
 
 def retrieve_clause(clause: str, corpus: dict) -> dict:
     """단일 특약에 대해 Query Expansion → BM25 → Dense → RRF를 실행한다."""
-    # Query Expansion
-    expansion = expand_clause(clause, overfit_mode=True)
+    expansion = expand_clause(clause)
     payload = build_retrieval_payload(expansion, clause_text=clause)
     log.info("    QE keywords: %s", payload["bm25_keywords"])
 
-    # BM25
     query_tokens = build_query_tokens(payload["bm25_keywords"])
     bm25_hits: dict[str, tuple[int, str]] = {}
     for docs, bm25, source_type, id_field in [
@@ -106,7 +126,6 @@ def retrieve_clause(clause: str, corpus: dict) -> dict:
         sum(1 for _, st in bm25_hits.values() if st == "precedent"),
     )
 
-    # Dense (embed_vertex, 동일 doc_id는 최고 rank 유지)
     def _embed_and_search(col: str) -> list[tuple[str, int, str]]:
         query_vec = dense_retrieval.embed_query(payload["dense_query"], col)
         hits = []
@@ -131,7 +150,6 @@ def retrieve_clause(clause: str, corpus: dict) -> dict:
         sum(1 for _, st in dense_hits.values() if st == "precedent"),
     )
 
-    # RRF
     all_ids = set(bm25_hits) | set(dense_hits)
     scored = []
     for doc_id in all_ids:
@@ -153,7 +171,9 @@ def retrieve_clause(clause: str, corpus: dict) -> dict:
         x["doc_id"],
     ))
 
-    results = scored[:TOP_K]
+    # 주의: 여기서 상위 TOP_K개로 미리 자르지 않는다. law/precedent가 섞인
+    # 상태로 자르면 타입별 recall@k 계산 시 후보가 부족해질 수 있다.
+    results = scored
     for rank, item in enumerate(results, 1):
         item["rank"] = rank
 
@@ -170,7 +190,9 @@ def retrieve_clause(clause: str, corpus: dict) -> dict:
     return {"bm25": bm25_results, "dense": dense_results, "rrf": results}
 
 
-RESULTS_PATH = Path(__file__).resolve().parent / "eval_results.json"
+def _type_ranked_ids(clause_result: dict, method: str, source_type: str) -> list[str]:
+    """clause_result[method]에서 지정한 타입만, 순위 순서 그대로 doc_id 리스트로 뽑는다."""
+    return [r["doc_id"] for r in clause_result[method] if r["source_type"] == source_type]
 
 
 def _recall_at_k(
@@ -180,34 +202,68 @@ def _recall_at_k(
     gt_laws: set[str],
     gt_cases: set[str],
 ) -> dict:
+    """법령/판례를 각각 독립적으로 상위 k개씩 잘라서 recall/precision/F1을 계산한다.
+
+    - recall@k    = (상위 k개 안에 든 정답 수) / (전체 정답 수)
+    - precision@k = (상위 k개 중 정답인 것 수) / (내놓은 상위 k개 결과 수)
+      * gt에 특약과 무관한 조문이 섞여 정답 수가 부풀려진 상황에서, recall만
+        보면 억울하게 낮아진다. precision은 분모가 '검색 결과 수'라 이 문제에
+        덜 휘둘린다. 단 precision만 보면 '적게 내놓고 맞히면 만점' 함정이 있어
+        recall과 함께 봐야 한다.
+    - f1@k = recall과 precision의 조화평균
+    """
     pool_laws: set[str] = set()
     pool_cases: set[str] = set()
     for clause_result in per_clause:
-        for r in clause_result[method][:k]:
-            if r["source_type"] == "law":
-                pool_laws.add(r["doc_id"])
-            else:
-                pool_cases.add(r["doc_id"])
+        pool_laws.update(_type_ranked_ids(clause_result, method, "law")[:k])
+        pool_cases.update(_type_ranked_ids(clause_result, method, "precedent")[:k])
     law_hits = _count_hits(gt_laws, pool_laws)
     prec_hits = _count_hits(gt_cases, pool_cases)
     law_total = len(gt_laws)
     prec_total = len(gt_cases)
+
+    # precision 분모: 실제로 내놓은 결과 수 (pool 크기)
+    law_returned = len(pool_laws)
+    case_returned = len(pool_cases)
+    # precision hit: 내놓은 결과 중 gt에 실제로 속하는 것 수
+    law_correct = sum(1 for d in pool_laws if _is_hit(gt_laws, d))
+    case_correct = sum(1 for d in pool_cases if _is_hit(gt_cases, d))
+
+    law_recall = law_hits / law_total if law_total else None
+    law_precision = law_correct / law_returned if law_returned else None
+    prec_recall = prec_hits / prec_total if prec_total else None
+    prec_precision = case_correct / case_returned if case_returned else None
+
     return {
         "law_hits": law_hits,
         "law_total": law_total,
-        "law_recall": round(law_hits / law_total, 4) if law_total else None,
+        "law_returned": law_returned,
+        "law_correct": law_correct,
+        "law_recall": round(law_recall, 4) if law_recall is not None else None,
+        "law_precision": round(law_precision, 4) if law_precision is not None else None,
+        "law_f1": round(_f1(law_recall, law_precision), 4) if (law_recall and law_precision) else None,
         "precedent_hits": prec_hits,
         "precedent_total": prec_total,
-        "precedent_recall": round(prec_hits / prec_total, 4) if prec_total else None,
+        "precedent_returned": case_returned,
+        "precedent_correct": case_correct,
+        "precedent_recall": round(prec_recall, 4) if prec_recall is not None else None,
+        "precedent_precision": round(prec_precision, 4) if prec_precision is not None else None,
+        "precedent_f1": round(_f1(prec_recall, prec_precision), 4) if (prec_recall and prec_precision) else None,
     }
 
 
-def _count_hits(gt_set: set[str], pool: set[str]) -> int:
-    """GT 항목 중 pool에서 prefix 매칭되는 항목 수를 반환한다.
+def _f1(recall: float | None, precision: float | None) -> float:
+    if not recall or not precision:
+        return 0.0
+    return 2 * recall * precision / (recall + precision)
 
-    검색 결과 doc_id가 GT의 하위 조항일 수 있으므로 (예: GT=제7조, 결과=제7조_제1항)
-    GT가 retrieved doc_id의 접두어인 경우도 hit으로 처리한다.
-    """
+
+def _is_hit(gt_set: set[str], doc_id: str) -> bool:
+    """doc_id가 gt_set의 항목과 정확히 같거나, gt 조문의 하위 항인지 확인한다."""
+    return any(doc_id == gt or doc_id.startswith(gt + "_") for gt in gt_set)
+
+
+def _count_hits(gt_set: set[str], pool: set[str]) -> int:
     count = 0
     for gt in gt_set:
         if any(doc_id == gt or doc_id.startswith(gt + "_") for doc_id in pool):
@@ -215,13 +271,68 @@ def _count_hits(gt_set: set[str], pool: set[str]) -> int:
     return count
 
 
-def _write_results(results: list[dict]) -> None:
-    RESULTS_PATH.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+def _precision1_and_mrr(
+    per_clause: list[dict],
+    method: str,
+    gt_laws: set[str],
+    gt_cases: set[str],
+) -> dict:
+    """법령/판례 각각에 대해 precision@1과 MRR을 계산한다.
+
+    - precision@1: 해당 타입 후보 중 1위로 뽑힌 문서가 gt에 속하는 케이스의 비율
+      (gt가 있는 케이스만 분모에 포함)
+    - MRR: gt에 처음 맞은 후보의 순위(rank)의 역수(1/rank) 평균
+      (그 타입 후보 안에 gt가 아예 없으면 0으로 취급)
+    """
+    law_p1_hits, law_p1_total = 0, 0
+    prec_p1_hits, prec_p1_total = 0, 0
+    law_rr_sum, law_rr_total = 0.0, 0
+    prec_rr_sum, prec_rr_total = 0.0, 0
+
+    for clause_result in per_clause:
+        law_ranked = _type_ranked_ids(clause_result, method, "law")
+        prec_ranked = _type_ranked_ids(clause_result, method, "precedent")
+
+        if gt_laws:
+            law_p1_total += 1
+            if law_ranked and _is_hit(gt_laws, law_ranked[0]):
+                law_p1_hits += 1
+            law_rr_total += 1
+            for rank, doc_id in enumerate(law_ranked, 1):
+                if _is_hit(gt_laws, doc_id):
+                    law_rr_sum += 1 / rank
+                    break
+
+        if gt_cases:
+            prec_p1_total += 1
+            if prec_ranked and _is_hit(gt_cases, prec_ranked[0]):
+                prec_p1_hits += 1
+            prec_rr_total += 1
+            for rank, doc_id in enumerate(prec_ranked, 1):
+                if _is_hit(gt_cases, doc_id):
+                    prec_rr_sum += 1 / rank
+                    break
+
+    return {
+        "law_precision_at_1": round(law_p1_hits / law_p1_total, 4) if law_p1_total else None,
+        "law_precision_at_1_n": law_p1_total,
+        "law_mrr": round(law_rr_sum / law_rr_total, 4) if law_rr_total else None,
+        "law_mrr_n": law_rr_total,
+        "precedent_precision_at_1": round(prec_p1_hits / prec_p1_total, 4) if prec_p1_total else None,
+        "precedent_precision_at_1_n": prec_p1_total,
+        "precedent_mrr": round(prec_rr_sum / prec_rr_total, 4) if prec_rr_total else None,
+        "precedent_mrr_n": prec_rr_total,
+    }
 
 
 def main() -> None:
-    log.info("▶ eval_set.json 로드: %s", EVAL_SET_PATH)
-    cases = json.loads(EVAL_SET_PATH.read_text(encoding="utf-8"))
+    parser = argparse.ArgumentParser(description="법령/판례 검색 recall / precision@1 / MRR 평가")
+    parser.add_argument("--eval-set", type=Path, required=True, help="평가셋 JSON 경로")
+    parser.add_argument("--results", type=Path, required=True, help="결과 저장 경로")
+    args = parser.parse_args()
+
+    log.info("▶ eval_set 로드: %s", args.eval_set)
+    cases = json.loads(args.eval_set.read_text(encoding="utf-8"))
     log.info("  케이스 %d개", len(cases))
 
     corpus = load_corpus()
@@ -231,6 +342,8 @@ def main() -> None:
         case_id = case["id"]
         clauses = [c["normalized"] for c in case["clauses"]]
         gt_laws = set(case["gt_laws"])
+        # gt_laws_explicit이 없는(예전 스키마) eval_set은 gt_laws 전체를 explicit으로 취급
+        gt_laws_explicit = set(case.get("gt_laws_explicit", case["gt_laws"]))
         gt_cases = set(case["gt_cases"])
         log.info(
             "[%d/%d] %s: 특약 %d개, gt_laws=%d, gt_cases=%d",
@@ -238,8 +351,9 @@ def main() -> None:
         )
 
         per_clause: list[dict] = [{"bm25": [], "dense": [], "rrf": []} for _ in clauses]
-        def _retrieve(args: tuple[int, str]) -> tuple[int, dict]:
-            j, clause = args
+
+        def _retrieve(args_tuple: tuple[int, str]) -> tuple[int, dict]:
+            j, clause = args_tuple
             log.info("  특약 [%d/%d]: %s...", j + 1, len(clauses), clause[:60])
             return j, retrieve_clause(clause, corpus)
 
@@ -252,19 +366,34 @@ def main() -> None:
                 except Exception as exc:
                     log.error("  특약 검색 실패: %s", exc)
 
-        # Recall@K: BM25 / Dense / RRF 각각 계산
         recall_at_k: dict[int, dict] = {}
+        recall_at_k_explicit: dict[int, dict] = {}
         for k in RECALL_K_VALUES:
             recall_at_k[k] = {
                 method: _recall_at_k(per_clause, method, k, gt_laws, gt_cases)
                 for method in ("bm25", "dense", "rrf")
             }
+            recall_at_k_explicit[k] = {
+                method: _recall_at_k(per_clause, method, k, gt_laws_explicit, gt_cases)
+                for method in ("bm25", "dense", "rrf")
+            }
+
+        precision_mrr = {
+            method: _precision1_and_mrr(per_clause, method, gt_laws, gt_cases)
+            for method in ("bm25", "dense", "rrf")
+        }
 
         rrf20 = recall_at_k[20]["rrf"]
+        rrf_pm = precision_mrr["rrf"]
         log.info(
             "  Recall@20 [RRF]  법령: %.3f (%d/%d)  판례: %.3f (%d/%d)",
             rrf20["law_recall"] or 0, rrf20["law_hits"], rrf20["law_total"],
             rrf20["precedent_recall"] or 0, rrf20["precedent_hits"], rrf20["precedent_total"],
+        )
+        log.info(
+            "  [RRF] 법령 P@1=%s MRR=%s  판례 P@1=%s MRR=%s",
+            rrf_pm["law_precision_at_1"], rrf_pm["law_mrr"],
+            rrf_pm["precedent_precision_at_1"], rrf_pm["precedent_mrr"],
         )
         clause_records = [
             {
@@ -278,28 +407,71 @@ def main() -> None:
         case_results.append({
             "id": case_id,
             "gt_laws": list(gt_laws),
+            "gt_laws_explicit": list(gt_laws_explicit),
             "gt_cases": list(gt_cases),
             "recall_at_k": recall_at_k,
+            "recall_at_k_explicit": recall_at_k_explicit,
+            "precision_mrr": precision_mrr,
             "clauses": clause_records,
         })
-        _write_results(case_results)
-        log.info("  결과 저장: %s (%d/%d)", RESULTS_PATH, i + 1, len(cases))
+        args.results.write_text(
+            json.dumps(case_results, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        log.info("  결과 저장: %s (%d/%d)", args.results, i + 1, len(cases))
 
-    # 전체 집계
+    def _agg_law(key: str, k: int, method: str) -> tuple:
+        hits = sum(c[key][k][method]["law_hits"] for c in case_results)
+        total = sum(c[key][k][method]["law_total"] for c in case_results)
+        returned = sum(c[key][k][method]["law_returned"] for c in case_results)
+        correct = sum(c[key][k][method]["law_correct"] for c in case_results)
+        recall = hits / total if total else 0.0
+        precision = correct / returned if returned else 0.0
+        f1 = _f1(recall, precision)
+        return recall, precision, f1, hits, total, correct, returned
+
     print("\n" + "=" * 70)
-    print(f"전체 Recall 집계 ({len(case_results)}케이스)")
+    print(f"전체 집계 - 직접인용+보강 결합 ({len(case_results)}케이스)  [법령 기준]")
     print("=" * 70)
     for k in RECALL_K_VALUES:
-        print(f"  Recall@{k:2d}")
         for method in ("bm25", "dense", "rrf"):
-            lh = sum(r["recall_at_k"][k][method]["law_hits"] for r in case_results)
-            lt = sum(r["recall_at_k"][k][method]["law_total"] for r in case_results)
-            ph = sum(r["recall_at_k"][k][method]["precedent_hits"] for r in case_results)
-            pt = sum(r["recall_at_k"][k][method]["precedent_total"] for r in case_results)
+            r, p, f1, hits, total, correct, returned = _agg_law("recall_at_k", k, method)
             print(
-                f"    [{method:5s}]  법령: {lh/lt:.3f} ({lh}/{lt})  "
-                f"판례: {ph/pt:.3f} ({ph}/{pt})"
+                f"K={k:>2} [{method:>4}]  recall={r:.4f} ({hits}/{total})  "
+                f"precision={p:.4f} ({correct}/{returned})  F1={f1:.4f}"
             )
+
+    print("\n" + "=" * 70)
+    print(f"전체 집계 - 직접인용만 (신뢰도 높음) ({len(case_results)}케이스)  [법령 기준]")
+    print("=" * 70)
+    for k in RECALL_K_VALUES:
+        for method in ("bm25", "dense", "rrf"):
+            r, p, f1, hits, total, correct, returned = _agg_law("recall_at_k_explicit", k, method)
+            print(
+                f"K={k:>2} [{method:>4}]  recall={r:.4f} ({hits}/{total})  "
+                f"precision={p:.4f} ({correct}/{returned})  F1={f1:.4f}"
+            )
+
+    print("\n" + "=" * 70)
+    print("전체 Precision@1 / MRR 집계")
+    print("=" * 70)
+    for method in ("bm25", "dense", "rrf"):
+        law_p1_hits = sum(c["precision_mrr"][method]["law_precision_at_1_n"] * (c["precision_mrr"][method]["law_precision_at_1"] or 0) for c in case_results)
+        law_p1_total = sum(c["precision_mrr"][method]["law_precision_at_1_n"] for c in case_results)
+        law_rr_sum = sum((c["precision_mrr"][method]["law_mrr"] or 0) * c["precision_mrr"][method]["law_mrr_n"] for c in case_results)
+        law_rr_total = sum(c["precision_mrr"][method]["law_mrr_n"] for c in case_results)
+        prec_p1_hits = sum(c["precision_mrr"][method]["precedent_precision_at_1_n"] * (c["precision_mrr"][method]["precedent_precision_at_1"] or 0) for c in case_results)
+        prec_p1_total = sum(c["precision_mrr"][method]["precedent_precision_at_1_n"] for c in case_results)
+        prec_rr_sum = sum((c["precision_mrr"][method]["precedent_mrr"] or 0) * c["precision_mrr"][method]["precedent_mrr_n"] for c in case_results)
+        prec_rr_total = sum(c["precision_mrr"][method]["precedent_mrr_n"] for c in case_results)
+
+        law_p1 = round(law_p1_hits / law_p1_total, 4) if law_p1_total else None
+        law_mrr = round(law_rr_sum / law_rr_total, 4) if law_rr_total else None
+        prec_p1 = round(prec_p1_hits / prec_p1_total, 4) if prec_p1_total else None
+        prec_mrr = round(prec_rr_sum / prec_rr_total, 4) if prec_rr_total else None
+        print(
+            f"[{method:>4}]  법령 P@1={law_p1} (n={law_p1_total})  법령 MRR={law_mrr} (n={law_rr_total})  "
+            f"판례 P@1={prec_p1} (n={prec_p1_total})  판례 MRR={prec_mrr} (n={prec_rr_total})"
+        )
 
 
 if __name__ == "__main__":
