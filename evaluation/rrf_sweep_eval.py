@@ -16,7 +16,7 @@ RRF는 점수가 아니라 '순위'만 쓴다:
 - 참고로 alpha-가중합 현행(alpha=0.2)·Dense 단독 수치도 함께 출력한다.
 
 tune set에서만 스윕한다. test는 최종 1회용으로 건드리지 않는다.
-실행: python data/processors/weighted_rrf_sweep.py --eval-set evaluation/eval_set_tune.json
+실행: python data/processors/rrf_sweep_eval.py --eval-set evaluation/eval_set_tune.json
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 from sklearn.metrics.pairwise import cosine_similarity
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 
 from pipeline.retrieval.bm25_retrieval import tokenize, build_query_tokens, load_law_child_from_db
@@ -42,13 +42,27 @@ from sqlalchemy import text
 K_VALUES = [1, 3, 5, 10, 20, 50]
 TOP_K = 50
 
-# (w_bm25, w_dense) 조합 — Dense 우대 위주로
-WEIGHTS = [(1, 1), (1, 2), (1, 3), (1, 5), (2, 1), (3, 1), (1, 0), (0, 1)]
-RRF_KS = [10, 30, 60]
+# (w_bm25, w_dense) 조합 — 1:2 근처를 소수 단위로 촘촘하게
+# recall 우선이므로 Dense 우대 구간(1:1.5 ~ 1:3)을 0.25 간격으로 세밀 탐색
+WEIGHTS = [
+    (1, 1.25), (1, 1.5), (1, 1.75), (1, 2), (1, 2.25), (1, 2.5), (1, 2.75), (1, 3),
+    (1.25, 2), (1.5, 2), (1.75, 2),   # bm25쪽도 소수로 살짝
+    (1, 1), (0, 1),                    # 참고용 기준
+]
+RRF_KS = [10, 20, 30, 40, 50, 60]      # K도 더 촘촘하게
+
+
+import re
+
+
+def _article_of(key):
+    """clause_key에서 항/호/목을 떼고 '조' 단위까지만 남긴다."""
+    return re.sub(r'_(제\d+항|제\d+호|제\d+목).*$', '', key)
 
 
 def is_hit(gt_key, doc_id):
-    return doc_id == gt_key or doc_id.startswith(gt_key + "_")
+    # 조 단위 매칭 (항이 달라도 같은 조이면 정답)
+    return _article_of(gt_key) == _article_of(doc_id)
 
 
 def load_law_corpus():
@@ -133,7 +147,13 @@ def make_alpha(alpha):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval-set", type=Path, default=Path("evaluation/eval_set_tune.json"))
+    ap.add_argument("--qe-cache", type=Path, default=Path("evaluation/_qe_cache/qe_cache.json"),
+                    help="QE 결과 파일 캐시 경로 (미리 qe_cache.py로 채워두면 토큰 0)")
     args = ap.parse_args()
+
+    # QE 캐시 래퍼 (실험 전용). 캐시에 있으면 LLM 호출 없이 재사용.
+    from data.processors.qe_cache import CachedExpander
+    expander = CachedExpander(args.qe_cache, auto_flush=True)
 
     cases = json.loads(args.eval_set.read_text(encoding="utf-8"))
     docs = load_law_corpus()
@@ -144,11 +164,14 @@ def main():
     print("검색 순위 캐시 생성 (특약당 QE+BM25+Dense 1회)...")
     cache = []
     for i, case in enumerate(cases):
-        gt = set(case.get("gt_laws_explicit", case["gt_laws"]))
+        # v2 eval_set은 gt_laws 필드. 조 단위로 중복 제거해 분모 왜곡 방지.
+        raw_gt = case.get("gt_laws", []) or case.get("gt_laws_filtered", [])
+        gt = {_article_of(g) for g in raw_gt}
         if not gt:
             continue
         clause = case["clauses"][0]["normalized"]
-        payload = build_retrieval_payload(expand_clause(clause), clause_text=clause)
+        # QE 캐시 래퍼 사용 (실험 전용, 토큰 절약) — 서비스 코드 불변
+        payload = build_retrieval_payload(expander.expand(clause), clause_text=clause)
 
         bm25_scores = bm25.get_scores(build_query_tokens(payload["bm25_keywords"]))
         bm25_top = np.argsort(bm25_scores)[::-1][:TOP_K]
@@ -166,7 +189,7 @@ def main():
     print(f"\n캐시 완료: {len(cache)}건\n")
 
     def show(label, recalls, p1, mrr):
-        print(f"{label:<26} " + "  ".join(f"{recalls[k]:.3f}" for k in K_VALUES) + f"   {p1:.3f}  {mrr:.3f}")
+        print(f"{label:<24} " + "  ".join(f"{recalls[k]:.3f}" for k in K_VALUES) + f"   {p1:.3f}  {mrr:.3f}")
 
     print("=" * 90)
     print(f"{'방식':<26} " + "  ".join(f"R@{k:<2}" for k in K_VALUES) + "   P@1    MRR")
@@ -180,11 +203,13 @@ def main():
 
     # 가중 RRF 스윕
     best = None
+    all_results = []   # (label, recalls, p1, mrr) 전체 저장 → 상위 정렬용
     for rrf_k in RRF_KS:
         for wb, wd in WEIGHTS:
             r, p, m = eval_ranking_fn(cache, make_wrrf(wb, wd, rrf_k))
-            label = f"RRF K={rrf_k} w(bm25:dense)={wb}:{wd}"
+            label = f"RRF K={rrf_k} w={wb}:{wd}"
             show(label, r, p, m)
+            all_results.append((label, r, p, m))
             score = r[10]  # recall@10 기준
             if best is None or score > best[0]:
                 best = (score, label, r, p, m)
@@ -193,6 +218,14 @@ def main():
     score, label, r, p, m = best
     print(f"\n[recall@10 최적] {label}")
     print(f"  R@10={r[10]:.3f}  R@50={r[50]:.3f}  P@1={p:.3f}  MRR={m:.3f}")
+
+    # recall@10 상위 10개 — 한 점의 최고값이 아니라 '안정 구간'을 보기 위함
+    print("\n=== recall@10 상위 10 (안정 구간 확인용) ===")
+    print("  주의: 70건 tune에서 R@10 0.01 차이는 케이스 1개(1/70)라 노이즈일 수 있음.")
+    top = sorted(all_results, key=lambda x: -x[1][10])[:10]
+    for lbl, rr, pp, mm in top:
+        print(f"  R@10={rr[10]:.3f}  R@50={rr[50]:.3f}  P@1={pp:.3f}  MRR={mm:.3f}   {lbl}")
+    print(f"\n{expander.stats}")
 
 
 if __name__ == "__main__":

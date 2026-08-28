@@ -1,6 +1,6 @@
 """법령/판례 검색 평가 — 실제 DB 임베딩 pipeline 사용.
 
-원본(evaluation/legal_retrieval_eval.py) 대비 차이:
+원본(evaluation/retrieval_judge_eval.py) 대비 차이:
   1. recall@k를 법령/판례 타입별로 독립적으로 계산
      (원본은 법령+판례가 뒤섞인 리스트를 통째로 [:k]로 잘라서, 판례 후보가
      상위권을 차지하면 법령 recall이 부당하게 낮아지는 버그가 있었음)
@@ -17,7 +17,7 @@ pipeline/retrieval/query_expansion/query_expansion.py에서 완전히
 
 사용 예
 -------
-    python evaluation/legal_retrieval_eval_clean.py \
+    python evaluation/legal_retrieval_eval.py \
         --eval-set evaluation/eval_set_test.json \
         --results evaluation/eval_results_test.json
 """
@@ -29,6 +29,7 @@ import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import re
 
 from rank_bm25 import BM25Okapi
 
@@ -219,8 +220,8 @@ def _recall_at_k(
         pool_cases.update(_type_ranked_ids(clause_result, method, "precedent")[:k])
     law_hits = _count_hits(gt_laws, pool_laws)
     prec_hits = _count_hits(gt_cases, pool_cases)
-    law_total = len(gt_laws)
-    prec_total = len(gt_cases)
+    law_total = len({_article_of(g) for g in gt_laws})   # 조 단위 중복 제거
+    prec_total = len({_article_of(g) for g in gt_cases})
 
     # precision 분모: 실제로 내놓은 결과 수 (pool 크기)
     law_returned = len(pool_laws)
@@ -258,15 +259,24 @@ def _f1(recall: float | None, precision: float | None) -> float:
     return 2 * recall * precision / (recall + precision)
 
 
+def _article_of(key: str) -> str:
+    """clause_key에서 항/호/목을 떼고 '조' 단위까지만 남긴다."""
+    return re.sub(r'_(제\d+항|제\d+호|제\d+목).*$', '', key)
+
+
 def _is_hit(gt_set: set[str], doc_id: str) -> bool:
-    """doc_id가 gt_set의 항목과 정확히 같거나, gt 조문의 하위 항인지 확인한다."""
-    return any(doc_id == gt or doc_id.startswith(gt + "_") for gt in gt_set)
+    """조 단위로 매칭한다. gt와 검색결과 둘 다 '조'까지만 비교하므로,
+    항이 달라도 같은 조이면 정답으로 처리한다."""
+    doc_art = _article_of(doc_id)
+    return any(_article_of(gt) == doc_art for gt in gt_set)
 
 
 def _count_hits(gt_set: set[str], pool: set[str]) -> int:
+    pool_arts = {_article_of(d) for d in pool}
+    gt_arts = {_article_of(g) for g in gt_set}
     count = 0
-    for gt in gt_set:
-        if any(doc_id == gt or doc_id.startswith(gt + "_") for doc_id in pool):
+    for gt_art in gt_arts:
+        if gt_art in pool_arts:
             count += 1
     return count
 

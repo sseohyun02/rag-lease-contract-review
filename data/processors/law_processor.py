@@ -183,8 +183,17 @@ def build_parent_rows(articles: list[dict], basic_info: dict, hang_keys: set) ->
     return rows
 
 
-def build_child_rows(hang_rows: list[dict]) -> list[dict]:
-    """항호목 목록으로 child 행을 생성한다."""
+def build_child_rows(hang_rows: list[dict], parent_rows: list[dict] | None = None) -> list[dict]:
+    """항호목 목록으로 child 행을 생성한다.
+
+    항이 있는 조문은 항 단위로 child 를 만든다.
+    항이 없는 단일 조문(is_article_only=1)은 항호목 시트에 없어 누락되므로,
+    parent_rows 를 받아 조문 전체를 하나의 child 로 추가한다.
+        clause_key   = article_key   (항 접미사 없음)
+        paragraph_no = ""            (항 없음)
+        child_text   = parent_text   (조문 내용 전체가 검색 단위)
+    (삭제 조문은 검색 대상이 아니므로 제외한다.)
+    """
     rows = []
     for hang in hang_rows:
         law_name = hang["law_name"]
@@ -207,6 +216,29 @@ def build_child_rows(hang_rows: list[dict]) -> list[dict]:
             "paragraph_no": int(paragraph_no) if paragraph_no else "",
             "child_text": child_text,
         })
+
+    # 항 없는 단일 조문을 child 로 추가 (parent_rows 기반)
+    if parent_rows:
+        article_only_added = 0
+        for p in parent_rows:
+            if p.get("is_article_only") != 1:
+                continue
+            if p.get("is_deleted") == 1:          # 삭제 조문은 제외
+                continue
+            child_text = (p.get("parent_text") or "").strip()
+            if not child_text:                     # 내용 없으면 제외
+                continue
+            rows.append({
+                "clause_key": p["article_key"],    # 항 없으므로 article_key 그대로
+                "article_key": p["article_key"],
+                "law_name": p["law_name"],
+                "article_no": p["article_no"],
+                "paragraph_no": "",                # 항 없음
+                "child_text": child_text,          # 조문 내용 전체
+            })
+            article_only_added += 1
+        print(f"  항 없는 조문 child 추가: {article_only_added}건")
+
     return rows
 
 
@@ -246,7 +278,8 @@ def run(
     print(f"  항호목: {len(hang_rows)}건")
 
     parent_rows = build_parent_rows(articles, basic_info, hang_keys)
-    child_rows = build_child_rows(hang_rows)
+    # 항 없는 조문도 child 에 포함하려면 parent_rows 를 함께 전달한다.
+    child_rows = build_child_rows(hang_rows, parent_rows)
 
     # 삭제 조문 통계
     deleted_count = sum(1 for r in parent_rows if r["is_deleted"] == 1)

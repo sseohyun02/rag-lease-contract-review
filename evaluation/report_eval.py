@@ -9,7 +9,7 @@ LLM-as-a-Judge: report_generator.py 출력 품질 평가
         --report output/test_rag_104_report.json \
         --output output/test_rag_104_judge.json
     # 폴더 전체
-    python evaluation/judge_eval.py --report output/
+    python evaluation/jreport_eval.py --report output/
 """
 
 import argparse

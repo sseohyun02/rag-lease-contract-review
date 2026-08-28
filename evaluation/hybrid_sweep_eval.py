@@ -19,7 +19,7 @@
 gt/결과 매칭은 조 단위가 아니라 기존 평가와 동일하게 clause_key prefix로 한다
 (gt가 조 단위면 검색된 항이 그 조에 속하면 hit).
 
-실행: python data/processors/alpha_sweep.py --eval-set evaluation/eval_set_tune.json
+실행: python evaluation/hybrid_sweep_eval.py --eval-set evaluation/eval_set_tune.json
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 from sklearn.metrics.pairwise import cosine_similarity
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 
 from pipeline.retrieval.bm25_retrieval import (

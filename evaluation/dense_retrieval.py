@@ -4,8 +4,8 @@
 임계값을 0.0~1.0 사이로 변화시키며 Recall@K와 평균 반환 건수를 측정한다.
 
 사용 예:
-    python evaluation/threshold_sweep_eval.py --threshold-step 0.05 --top-k 10 20
-    python evaluation/threshold_sweep_eval.py --threshold-start 0.1 --threshold-end 0.5 --threshold-step 0.05
+    python evaluation/dense_retrieval.py --threshold-step 0.05 --top-k 10 20
+    python evaluation/dense_retrieval.py --threshold-start 0.1 --threshold-end 0.5 --threshold-step 0.05
 """
 
 from __future__ import annotations
@@ -285,7 +285,7 @@ def run_sweep(
     best_thr, best_score = find_best(summary, primary_k=primary_k)
 
     report = {
-        "schema_version": "threshold_sweep_eval.v1",
+        "schema_version": "dense_sweep_eval.v1",
         "run": {
             "input_path": str(input_path),
             "embed_col": EMBED_COL,

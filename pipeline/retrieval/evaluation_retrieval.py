@@ -1,6 +1,6 @@
 """법령/판례 검색 평가 — 실제 DB 임베딩 pipeline 사용.
 
-원본(evaluation/legal_retrieval_eval.py) 대비 차이:
+원본(evaluation/retrieval_eval.py) 대비 차이:
   1. recall@k를 법령/판례 타입별로 독립적으로 계산
      (원본은 법령+판례가 뒤섞인 리스트를 통째로 [:k]로 잘라서, 판례 후보가
      상위권을 차지하면 법령 recall이 부당하게 낮아지는 버그가 있었음)
@@ -17,7 +17,7 @@ pipeline/retrieval/query_expansion/query_expansion.py에서 완전히
 
 사용 예
 -------
-    python evaluation/legal_retrieval_eval_clean.py \
+    python evaluation/retrieval_eval.py \
         --eval-set evaluation/eval_set_test.json \
         --results evaluation/eval_results_test.json
 """

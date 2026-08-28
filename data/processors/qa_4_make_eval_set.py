@@ -1,10 +1,10 @@
-"""검수 완료된 gt_from_reasoning_final.json을 평가용 eval_set으로 변환한다.
+"""검수 완료된 gt_from_reasoning.json을 평가용 eval_set으로 변환한다.
 
 하는 일 (DB/API 불필요 - 형식 변환만)
 ----
-1. gt_from_reasoning_final.json을 읽는다.
+1. gt_from_reasoning.json을 읽는다.
 2. gt_laws_filtered(검수 후 정답)가 1개 이상인 케이스만 남긴다.
-3. 평가 스크립트(legal_retrieval_eval.py)가 읽는 형식으로 변환한다:
+3. 평가 스크립트(retrieval_eval.py)가 읽는 형식으로 변환한다:
    - clause          -> clauses[0].normalized
    - gt_laws_filtered -> gt_laws (그리고 gt_laws_explicit도 동일값으로)
    - concepts/detail 등 검수용 필드는 제거
@@ -21,7 +21,7 @@ import json
 import random
 from pathlib import Path
 
-INPUT_PATH = Path("evaluation/gt_from_reasoning_final.json")
+INPUT_PATH = Path("evaluation/gt_from_reasoning.json")
 OUTPUT_TUNE_PATH = Path("evaluation/eval_set_tune.json")
 OUTPUT_TEST_PATH = Path("evaluation/eval_set_test.json")
 

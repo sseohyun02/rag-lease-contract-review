@@ -4,8 +4,8 @@ Dense 유사도 검색은 in-memory numpy 대신 PostgreSQL pgvector (<=> 코사
 → load() 시 임베딩 벡터를 메모리에 올리지 않아 RAM 사용량이 대폭 줄어든다.
 
 리랭킹 방식: alpha_hybrid
-  - 법령:  α=0.20 → BM25 20% + Dense 80%  (Dense 위주 — 의미 기반)
-  - 판례:  α=0.70 → BM25 70% + Dense 30%  (BM25 위주 — 키워드 기반)
+  - 법령:  가중 RRF (K=30, w_bm25:w_dense=1:2) — 순위 기반 융합, Dense 우대
+  - 판례:  α=0.70 → BM25 70% + Dense 30%  (BM25 위주 — 키워드 기반, 추후 RRF 검토)
   - 법령/판례 각각 독립 랭킹 후 합산 → 두 도메인 결과 보장
 
 alpha 값은 alpha_sweep 평가 최적값 (alpha_sweep_2d_20260530_235115) 사용.
@@ -22,8 +22,14 @@ import logging
 log = logging.getLogger(__name__)
 
 TOP_K      = 20   # 법령/판례 각각 상위 K개 → 총 최대 2*TOP_K 반환
-ALPHA_LAW  = 0.20  # 법령: BM25 20% + Dense 80%
+ALPHA_LAW  = 0.20  # 법령: BM25 20% + Dense 80%  (구 방식, 미사용 — 참고용 보존)
 ALPHA_PREC = 0.70  # 판례: BM25 70% + Dense 30%
+
+# 법령 리랭킹: 가중 RRF (score = w_bm25/(K+rank_bm25) + w_dense/(K+rank_dense))
+# v2 골드셋 기준 그리드서치(tune 70건)에서 recall@10 최적값. alpha=0.2 대비 R@10 0.418→0.463.
+RRF_K_LAW       = 30
+RRF_W_BM25_LAW  = 1.0
+RRF_W_DENSE_LAW = 2.0
 
 # pgvector <=> 는 (1 - cosine_similarity) 를 반환한다.
 _MIN_SIM  = 0.2
@@ -141,8 +147,10 @@ class RetrievalService:
         norm_bm25  = self._minmax(bm25_raw_all)
         norm_dense = self._minmax(dense_raw_all)
 
-        # ── Alpha Hybrid (법령/판례 독립 랭킹, 각자 rank 1~TOP_K) ──────
-        law_results  = self._alpha_hybrid(bm25_law_scores,  dense_law_scores,  norm_bm25, norm_dense, ALPHA_LAW,  "law",       TOP_K)
+        # ── 법령: 가중 RRF (rank 기반) / 판례: 기존 Alpha Hybrid ──────
+        law_results  = self._weighted_rrf(
+            bm25_law_scores, dense_law_scores,
+            RRF_W_BM25_LAW, RRF_W_DENSE_LAW, RRF_K_LAW, "law", TOP_K)
         prec_results = self._alpha_hybrid(bm25_prec_scores, dense_prec_scores, norm_bm25, norm_dense, ALPHA_PREC, "precedent", TOP_K)
 
         # BM25 / Dense 결과 목록 (디버깅/검증용)
@@ -239,6 +247,46 @@ class RetrievalService:
         if hi == lo:
             return {k: 0.0 for k in scores}
         return {k: (v - lo) / (hi - lo) for k, v in scores.items()}
+
+    def _weighted_rrf(
+        self,
+        bm25_scores:  dict[str, tuple[int, str, float]],
+        dense_scores: dict[str, tuple[int, str, float]],
+        w_bm25: float,
+        w_dense: float,
+        rrf_k: int,
+        source_type: str,
+        top_k: int,
+    ) -> list[dict]:
+        """가중 RRF로 융합 후 상위 top_k 반환.
+
+        score = w_bm25 * 1/(rrf_k + rank_bm25) + w_dense * 1/(rrf_k + rank_dense)
+        점수(raw)가 아니라 순위(rank)만 사용하므로 점수 정규화 왜곡이 없다.
+        rank 는 bm25_scores/dense_scores 튜플의 [0] (1부터 시작하는 도메인 내 순위)이다.
+        """
+        all_ids = set(bm25_scores) | set(dense_scores)
+        scored = []
+        for doc_id in all_ids:
+            s = 0.0
+            b_rank = bm25_scores[doc_id][0]  if doc_id in bm25_scores  else None
+            d_rank = dense_scores[doc_id][0] if doc_id in dense_scores else None
+            if b_rank is not None:
+                s += w_bm25 * 1.0 / (rrf_k + b_rank)
+            if d_rank is not None:
+                s += w_dense * 1.0 / (rrf_k + d_rank)
+            scored.append({
+                "doc_id":       doc_id,
+                "source_type":  source_type,
+                "rank":         0,
+                "hybrid_score": round(s, 8),
+                "bm25_rank":    b_rank,
+                "dense_rank":   d_rank,
+            })
+        scored.sort(key=lambda x: x["hybrid_score"], reverse=True)
+        top = scored[:top_k]
+        for rank, item in enumerate(top, 1):
+            item["rank"] = rank
+        return top
 
     def _alpha_hybrid(
         self,
