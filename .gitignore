@@ -5,16 +5,13 @@
 !firebase.json
 
 # 데이터 (용량 큼)
-data/raw/
+data/law_raw/
 data/law_chunks/
 case_law.csv
-qa_raw/
+data/qa_raw/
 data/lawtalk_qa_filtered/
-lawtalk_qa_preprocessed/
-qa_output/
 evaluation/results/
 keyword_analysis_output/
-output/
 *.log
 
 # Python

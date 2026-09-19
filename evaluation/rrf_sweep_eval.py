@@ -34,7 +34,6 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from pipeline.retrieval.bm25_retrieval import tokenize, build_query_tokens, load_law_child_from_db
 from pipeline.retrieval import dense_retrieval
-from pipeline.retrieval.query_expansion.query_expansion import expand_clause
 from pipeline.retrieval.query_expansion.retrieval_adapter import build_retrieval_payload
 from shared.db.connection import get_db_client
 from sqlalchemy import text

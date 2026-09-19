@@ -7,7 +7,6 @@ Cloud SQL PostgreSQL에 적재한다.
 from __future__ import annotations
 
 import argparse
-import ast
 import csv
 import io
 import json

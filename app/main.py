@@ -1,13 +1,14 @@
 """ADE Contract Analysis API.
 
-엔드포인트 구성:
+엔드포인트 구성(실제 사용 흐름):
   GET  /health, /healthz         — 헬스 체크
-  POST /api/layout_parse         — PDF → 계약서 구조 파싱
-  POST /api/query_expansion      — layout_parse + 특약별 쿼리 확장
-  POST /api/retrieval            — query_expansion + BM25/Dense/RRF 검색
-  POST /api/reranking            — retrieval + 상위 문서 내용 조회 (enrichment)
+  POST /api/documents            — PDF 업로드 + 파싱(+백그라운드 저장), 히스토리 CRUD
+  POST /api/analyze/clause_v2    — 단일 특약: 쿼리확장 → 검색 → 문서병합 → LLM 요약
+  POST /api/analyze/report_v2    — 특약 요약 취합 → 최종 체크리스트/연관성 리포트
+  POST /api/analyze/rewrite_clause — 위반 가능 특약 재작성
+  POST /api/chat                 — 리포트 컨텍스트 기반 챗봇
 
-각 단계는 이전 단계를 모두 포함하여 누적 실행한다.
+레거시(필요시 삭제 가능): /api/layout_parse, /api/query_expansion, /api/retrieval, /api/reranking
 """
 from __future__ import annotations
 
@@ -18,10 +19,9 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from datetime import datetime
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, status, Response
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
@@ -40,8 +40,7 @@ from app.schemas import (
     LayoutParseResponse,
     QueryExpansionResponse,
     RankedDocument,
-    ReportRequest,
-    ReportV2Request,
+    ReportV2Request,        # analyze_report_v2가 사용 — 기존 목록에서 누락돼 있어 추가함
     RerankingResponse,
     RetrievalHit,
     RetrievalResponse,
@@ -53,8 +52,15 @@ from app.schemas import (
 from pipeline.preprocessing.schema import LeaseContract
 from pipeline.retrieval.query_expansion.query_expansion_schema import ClauseQueryExpansion
 from pipeline.retrieval.retrieval_service import retrieval_service
-from pipeline.generation.report_generator import generate_report_from_data, ReportOutput
-from pipeline.generation.report_generator_v2 import generate_clause_summary, generate_final_report, generate_clause_rewrite, FinalReportOutput, COMMON_TERMS_COUNT
+# report_generator_v2를 report_generator로 rename했으므로 새 모듈명에서 import한다.
+# v1 전용이던 generate_report_from_data, ReportOutput은 파일 삭제와 함께 사라졌으므로 넣지 않는다.
+from pipeline.generation.report_generator import (
+    generate_clause_summary,
+    generate_final_report,
+    generate_clause_rewrite,
+    FinalReportOutput,
+    COMMON_TERMS_COUNT,
+)
 from shared.db.connection import get_db_client
 from shared.storage.gcs_client import get_gcs_client
 
@@ -271,40 +277,11 @@ async def delete_document(doc_id: str, client_id: str):
     return {"message": "문서가 성공적으로 삭제되었습니다."}
 
 
-@app.post("/api/analyze/clause", response_model=ClauseAnalysisResponse)
-async def analyze_single_clause(request: AnalyzeClauseRequest) -> ClauseAnalysisResponse:
-    """단일 특약에 대해 쿼리 확장 -> 하이브리드 검색 -> 리랭킹 파이프라인을 실행한다."""
-    if not retrieval_service.is_ready:
-        raise HTTPException(status_code=503, detail="코퍼스 로딩 중")
-
-    # 1. 쿼리 확장 (상위 COMMON_TERMS_COUNT개 특약은 건너뜀)
-    if request.clause_index < COMMON_TERMS_COUNT:
-        return ClauseAnalysisResponse(
-            index=request.clause_index,
-            clause=request.clause_text,
-            expansion=ClauseQueryExpansion(expansion_query="", keywords=[]),
-            law_results=[],
-            prec_results=[],
-        )
-    
-    expansion = await _run_in_executor(_expand_clause, request.clause_index, request.clause_text)
-
-
-@app.post("/api/analyze/report", response_model=ReportOutput)
-async def analyze_report(request: ReportRequest) -> ReportOutput:
-    """모든 특약의 분석 결과를 취합하여 최종 체크리스트와 보고서를 생성한다."""
-    if not retrieval_service.is_ready:
-        raise HTTPException(status_code=503, detail="코퍼스 로딩 중")
-
-    def _run_report_gen():
-        clauses_with_hits_dict = [c.model_dump() for c in request.clauses_with_hits]
-        return generate_report_from_data(
-            property_info=request.property_info,
-            common_terms=request.common_terms,
-            clauses_with_hits=clauses_with_hits_dict
-        )
-
-    return await _run_in_executor(_run_report_gen)
+# 삭제됨: @app.post("/api/analyze/clause") analyze_single_clause
+#   - v1 엔드포인트이며 본문이 미완성(return 없음)이었음. 프론트는 clause_v2만 호출하므로 제거.
+# 삭제됨: @app.post("/api/analyze/report") analyze_report
+#   - v1 전용 심볼 ReportOutput / generate_report_from_data를 참조했는데
+#     report_generator(v1) 삭제로 두 심볼이 사라졌음. 프론트도 report_v2만 호출하므로 제거.
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -327,7 +304,7 @@ async def analyze_single_clause_v2(request: AnalyzeClauseRequest) -> ClauseAnaly
             prec_results=[],
             llm_related_laws=[],
         )
-    
+
     expansion = await _run_in_executor(_expand_clause, request.clause_index, request.clause_text)
 
     # 2. 하이브리드 검색
@@ -335,7 +312,7 @@ async def analyze_single_clause_v2(request: AnalyzeClauseRequest) -> ClauseAnaly
 
     # 3. 리랭킹 및 문서 내용 병합
     ranking_res = await _run_in_executor(_rerank_all, [retrieval_res])
-    
+
     law_results = ranking_res[0].law_results if ranking_res else []
     prec_results = ranking_res[0].prec_results if ranking_res else []
 
@@ -351,17 +328,19 @@ async def analyze_single_clause_v2(request: AnalyzeClauseRequest) -> ClauseAnaly
     llm_result = await _run_in_executor(_run_llm_summary)
     clause_one_line_summary = llm_result.get("clause_one_line_summary", "") if llm_result else ""
     clause_interpretation = llm_result.get("clause_interpretation", "") if llm_result else ""
+    # TODO(확인): generate_clause_summary 반환 dict의 실제 키가 "related_laws"인지 "selected_laws"인지 대조할 것.
+    #             키가 다르면 아래 summary_map / warning / is_violation 매핑이 조용히 전부 스킵된다.
     llm_related_laws = llm_result.get("related_laws", []) if llm_result else []
 
     # 5. 상세 결과에 LLM 분석 내용(이유/위배여부) 매핑
     # llm_related_laws: [{"ref", "type", "content", "summary", "is_violation", "is_caution"}]
     summary_map = {item["ref"]: item for item in llm_related_laws}
-    
+
     for doc in law_results:
         if doc.doc_id in summary_map:
             doc.warning = summary_map[doc.doc_id]["summary"]
             doc.is_violation = summary_map[doc.doc_id].get("is_violation", False)
-            
+
     for doc in prec_results:
         # 판례는 doc_id(사건번호)가 summary_map의 ref와 매칭됨
         if doc.doc_id in summary_map:
@@ -482,10 +461,10 @@ async def _expand_all(contract: LeaseContract) -> list[ClauseExpansion]:
     special_terms = [t.strip() for t in contract.special_terms if t.strip()]
 
     loop = asyncio.get_event_loop()
-    
+
     # Pre-allocate a list for all expansions, with placeholders for skipped terms
     all_expansions: list[ClauseExpansion | Any] = [None] * len(special_terms)
-    
+
     tasks = []
     task_indices = [] # To keep track of original indices for tasks
 
@@ -515,7 +494,7 @@ async def _expand_all(contract: LeaseContract) -> list[ClauseExpansion]:
                 detail=f"특약 {task_idx} 쿼리 확장 실패: {result}",
             )
         all_expansions[task_idx] = result
-            
+
     # Ensure all elements are ClauseExpansion and handle potential None if something went wrong
     final_clauses: list[ClauseExpansion] = []
     for item in all_expansions:
@@ -524,7 +503,7 @@ async def _expand_all(contract: LeaseContract) -> list[ClauseExpansion]:
         else:
             # This case should ideally not happen if logic is correct, but for safety
             log.warning("Unexpected None in all_expansions list, skipping.")
-            
+
     return sorted(final_clauses, key=lambda c: c.index)
 
 
@@ -591,6 +570,9 @@ def _retrieve_clause(clause: ClauseExpansion) -> ClauseRetrieval:
 def _rerank_all(clauses: list[ClauseRetrieval]) -> list[ClauseRanking]:
     """법령/판례 각각 상위 RERANKING_TOP_N 결과에 문서 내용을 조회해 반환한다.
 
+    참고: 실제 순위 융합(가중 RRF / α-하이브리드)은 retrieval_service에서 이미 끝났다.
+          이 함수는 재순위가 아니라 상위 N개에 DB 원문을 붙이는 enrichment다.
+          (이름이 오해를 부르므로 추후 _enrich_all 등으로 rename 검토)
     법령/판례는 독립 랭킹(각자 rank 1~N)이므로 분리하여 반환한다.
     """
     # 1) 모든 특약의 법령/판례 top-N 결과에서 doc_id 수집
@@ -739,41 +721,41 @@ async def _run_in_executor(func, *args):
 
 
 def search_legal_info(query: str) -> dict:
-    """부동산 및 임대차 관련 법령과 판례를 통합 검색합니다. 
+    """부동산 및 임대차 관련 법령과 판례를 통합 검색합니다.
     사용자의 질문이나 분석 중인 특약과 관련된 구체적인 조항이나 판결 요지를 DB에서 찾아줍니다.
-    
+
     Args:
         query: 검색어 (예: "임대차보호법 제6조", "전세권 설정 등기")
     """
     from pipeline.retrieval.query_expansion.query_expansion import expand_clause
     from pipeline.retrieval.query_expansion.retrieval_adapter import build_retrieval_payload
     from pipeline.retrieval.retrieval_service import retrieval_service
-    
+
     if not retrieval_service.is_ready:
         log.error("search_legal_info: RetrievalService가 아직 준비되지 않았습니다.")
         return {"laws": [], "precedents": []}
-    
+
     try:
         # 1. 쿼리 확장 및 페이로드 구성
         expansion = expand_clause(query)
         payload = build_retrieval_payload(expansion, clause_text=query)
-        
+
         # 2. 하이브리드 검색 수행
         res = retrieval_service.retrieve(payload)
-        
+
         # 3. 각 검색 방식의 상위 결과 추출 및 통합 (중복 제거)
         bm25_law_ids = [hit["doc_id"] for hit in res["bm25"] if hit["source_type"] == "law"][:5]
         bm25_prec_ids = [hit["doc_id"] for hit in res["bm25"] if hit["source_type"] == "precedent"][:5]
-        
+
         dense_law_ids = [hit["doc_id"] for hit in res["dense"] if hit["source_type"] == "law"][:5]
         dense_prec_ids = [hit["doc_id"] for hit in res["dense"] if hit["source_type"] == "precedent"][:5]
-        
+
         law_ids = list(dict.fromkeys(bm25_law_ids + dense_law_ids))[:8]
         prec_ids = list(dict.fromkeys(bm25_prec_ids + dense_prec_ids))[:8]
-        
+
         laws_content = _fetch_law_content(law_ids)
         precs_content = _fetch_prec_content(prec_ids)
-        
+
         # 4. 결과 정리
         final_laws = []
         for lid in law_ids:
@@ -783,7 +765,7 @@ def search_legal_info(query: str) -> dict:
                     "title": f"{c.get('law_name')} 제{c.get('article_no')}조",
                     "content": c.get("child_text") or c.get("parent_text")
                 })
-                
+
         final_precs = []
         for pid in prec_ids:
             if pid in precs_content:
@@ -792,7 +774,7 @@ def search_legal_info(query: str) -> dict:
                     "title": c.get("case_name") or pid,
                     "content": c.get("judgment_summary") or c.get("issue")
                 })
-                
+
         return {
             "laws": final_laws,
             "precedents": final_precs
@@ -808,7 +790,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     from shared.llm.gemini_client import gemini_client
     from shared.config import settings
     from google.genai import types
-    
+
     system_instruction = (
         "당신은 부동산 계약 전문 분석 AI 'CLARA'입니다.\n"
         "제공된 정보를 바탕으로 사용자의 질문에 답변하세요.\n"
@@ -817,7 +799,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         "2. **분석 리포트**: AI가 분석한 핵심 체크리스트와 각 특약별 법적 검토 결과입니다.\n"
         "3. **재작성된 특약(rewrittenClauses)**: 법령 위배 가능성이 있는 특약에 대해 사용자가 재작성을 요청한 경우, 수정된 특약 원문과 재작성 이유가 포함됩니다. 사용자가 재작성된 특약에 대해 물어볼 경우 이 데이터를 우선 참고하세요.\n"
         "4. **대화 히스토리**: 이전 대화 맥락을 파악하여 자연스러운 대화를 이어가세요.\n"
-        "4. **특약 번호 규칙 (반드시 준수)**: 화면에서 특약 목록의 첫 6개(인덱스 0~5)는 '공통특약'이고, 7번째(인덱스 6)부터가 '특약'입니다.\n"
+        "5. **특약 번호 규칙 (반드시 준수)**: 화면에서 특약 목록의 첫 6개(인덱스 0~5)는 '공통특약'이고, 7번째(인덱스 6)부터가 '특약'입니다.\n"
         "   - '특약 N' 또는 'N번 특약' → 공통특약을 **완전히 제외**한 일반 특약의 N번째. 즉 인덱스 (6 + N - 1)번에 해당합니다.\n"
         "   - '공통특약 N' → 공통 특약의 N번째. 즉 인덱스 (N - 1)번에 해당합니다.\n"
         "   - **핵심 원칙**: 사용자가 '공통특약'이라는 단어를 명시적으로 말하지 않는 한, '특약'은 절대로 공통특약을 가리키지 않습니다. '특약 2번'은 공통특약 2번이 아니라 인덱스 7번(일반 특약 2번째)입니다.\n\n"
@@ -827,7 +809,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         "**중요**: 제공된 파싱된 원본 문서 및 분석 리포트에 명시되지 않은 내용(예: 계약서에 없는 일반적인 법률 조항이나 판례에 대한 질문 등)에 대해서는 절대 당신의 내장 지식을 사용하여 추측성 답변(환각)을 하지 마세요. 반드시 '해당 내용은 현재 분석 중인 계약서나 리포트에서 확인할 수 없어 정확한 답변이 어렵습니다.'라고 정중히 거절하세요.\n"
         "확실하지 않은 법률적 판단은 반드시 변호사 등 전문가와 상담할 것을 권고하는 문구를 포함하세요."
     )
-    
+
     # 컨텍스트 구성
     context_data = {
         "raw_contract": request.context.get("rawContract"),
@@ -835,13 +817,13 @@ async def chat(request: ChatRequest) -> ChatResponse:
         "clauses": request.context.get("clauses")
     }
     context_str = json.dumps(context_data, ensure_ascii=False)
-    
+
     # 프롬프트 구성 (시스템 지침에 컨텍스트 포함)
     full_system_instruction = (
         f"{system_instruction}\n\n"
         f"현재 분석 중인 계약서 리포트 데이터:\n{context_str}"
     )
-    
+
     # 대화 이력 변환 (Gemini history 형식)
     history = []
     all_msgs = request.messages
@@ -854,12 +836,10 @@ async def chat(request: ChatRequest) -> ChatResponse:
                 role=role,
                 parts=[types.Part.from_text(text=msg.content)]
             ))
-            
+
     last_user_msg = all_msgs[-1].content
-    
+
     try:
-        from google.genai import types
-        
         async def _chat_with_tools_manual():
             # 도구 사용 일시 중단 (사용자 요청)
             chat_session = gemini_client._client.chats.create(
@@ -872,22 +852,22 @@ async def chat(request: ChatRequest) -> ChatResponse:
                 ),
                 history=history
             )
-            
+
             # send_message 도 동기 메서드이므로 executor에서 실행해야 함
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(_clause_executor, chat_session.send_message, last_user_msg)
-            
+
             # 도구를 사용하지 않으므로 빈 소스 반환
             all_sources = []
-                    
+
             answer_text = "".join([p.text for p in response.candidates[0].content.parts if p.text])
             if not answer_text:
                 answer_text = "답변을 생성할 수 없습니다."
-                
+
             return answer_text, all_sources
 
         answer_text, all_sources = await _chat_with_tools_manual()
-        
+
         return ChatResponse(answer=answer_text, sources=all_sources)
     except Exception as e:
         import traceback

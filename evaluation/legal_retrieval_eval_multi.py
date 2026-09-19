@@ -20,23 +20,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
-import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data.processors.validation_dataset_processor import (
-    case_law_has_clause_keyword,
-    coerce_export_id,
-    has_clause_keyword,
-    stable_scalar_sort_key,
-)
-
 PIPELINE_IMPORT_ERROR: ImportError | None = None
 try:
-    from pipeline.reranking import reranker as project_reranker
+    from evaluation import rrf_baseline
     from pipeline.retrieval.bm25_retrieval import (
         build_query_tokens,
         load_case_law_from_db,
@@ -266,160 +258,6 @@ def append_unique(items: list[str], additions: list[str]) -> None:
     for item in additions:
         if item not in items:
             items.append(item)
-
-
-def has_source_clause_keyword(row: dict[str, Any]) -> bool:
-    source_type = row.get("source_type")
-    source_text = row.get("source_text")
-    text_fields = source_text if isinstance(source_text, dict) else row
-
-    if source_type == "qa" or "question_body" in text_fields:
-        return has_clause_keyword(text_fields.get("question_body") or "")
-    if source_type == "case_law" or "case_id" in row:
-        return case_law_has_clause_keyword(text_fields)
-    return False
-
-
-# ── eval_set.json 빌드 헬퍼 ──────────────────────────────────────────────
-
-def preprocess_qa_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[Any, dict[str, Any]] = {}
-    for row in rows:
-        question_id = coerce_export_id(row["question_id"])
-        if question_id not in grouped:
-            grouped[question_id] = {
-                "source_type": "qa",
-                "source_id": question_id,
-                "question_id": question_id,
-                "question_title": row.get("question_title") or "",
-                "question_body": row.get("question_body") or "",
-                "gt_laws": [],
-                "gt_cases": [],
-                "answer_ids": [],
-                "n_answers": 0,
-            }
-        group = grouped[question_id]
-        question_body = row.get("question_body") or ""
-        if question_body and not has_clause_keyword(group["question_body"]):
-            group["question_body"] = question_body
-        group["answer_ids"].append(coerce_export_id(row["answer_id"]))
-        group["n_answers"] += 1
-        append_unique(group["gt_laws"], parse_text_array(row.get("referenced_laws")))
-        append_unique(group["gt_cases"], parse_text_array(row.get("referenced_cases")))
-
-    candidates: list[dict[str, Any]] = []
-    for group in sorted(
-        grouped.values(),
-        key=lambda item: stable_scalar_sort_key(item["question_id"]),
-    ):
-        if not has_source_clause_keyword(group):
-            continue
-        if not group["gt_laws"] and not group["gt_cases"]:
-            continue
-        group["gt_laws"] = sorted(group["gt_laws"])
-        group["gt_cases"] = sorted(group["gt_cases"])
-        group["answer_ids"] = sorted(group["answer_ids"], key=stable_scalar_sort_key)
-        candidates.append(group)
-    return candidates
-
-
-def build_eval_set_from_stage_rows(
-    qa_stage_rows: list[dict[str, Any]],
-    case_stage_rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for row in sorted(
-        qa_stage_rows,
-        key=lambda item: stable_scalar_sort_key(item.get("question_id", "")),
-    ):
-        if not has_source_clause_keyword({**row, "source_type": "qa"}):
-            continue
-        record = eval_record_from_qa_stage_row(row)
-        if record is not None:
-            records.append(record)
-
-    for row in sorted(
-        case_stage_rows,
-        key=lambda item: stable_scalar_sort_key(item.get("case_id", "")),
-    ):
-        if not has_source_clause_keyword({**row, "source_type": "case_law"}):
-            continue
-        record = eval_record_from_case_stage_row(row)
-        if record is not None:
-            records.append(record)
-
-    return records
-
-
-def eval_record_from_qa_stage_row(row: dict[str, Any]) -> dict[str, Any] | None:
-    source_id = coerce_export_id(row["question_id"])
-    return build_stage_eval_record(
-        source_type="qa",
-        source_id=source_id,
-        source_text={"question_body": row.get("question_body") or ""},
-        gt_laws=row.get("gt_laws") or [],
-        gt_cases=row.get("gt_cases") or [],
-        meta={
-            "question_title": row.get("question_title") or "",
-            "answer_ids": row.get("answer_ids") or [],
-            "n_answers": row.get("n_answers") or 0,
-        },
-        stage1=row.get("stage1") or {},
-        stage5=row.get("stage5") or [],
-    )
-
-
-def eval_record_from_case_stage_row(row: dict[str, Any]) -> dict[str, Any] | None:
-    source_id = coerce_export_id(row["case_id"])
-    return build_stage_eval_record(
-        source_type="case_law",
-        source_id=source_id,
-        source_text={
-            "issue": row.get("issue") or "",
-            "judgment_summary": row.get("judgment_summary") or "",
-            "case_detail": row.get("case_detail") or "",
-        },
-        gt_laws=row.get("gt_laws") or [],
-        gt_cases=row.get("gt_cases") or [],
-        meta={
-            "case_name": row.get("case_name") or "",
-            "case_number": row.get("case_number") or "",
-            "judgment_date": row.get("judgment_date") or "",
-            "court_name": row.get("court_name") or "",
-        },
-        stage1=row.get("stage1") or {},
-        stage5=row.get("stage5") or [],
-    )
-
-
-def build_stage_eval_record(
-    *,
-    source_type: str,
-    source_id: int | str,
-    source_text: dict[str, str],
-    gt_laws: list[str],
-    gt_cases: list[str],
-    meta: dict[str, Any],
-    stage1: dict[str, Any],
-    stage5: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    clause_type = stage1.get("clause_type")
-    if clause_type == "mention_only" or not stage1.get("is_evaluable"):
-        return None
-    clauses = stage_clauses(clause_type, stage1.get("extracted_clauses") or [], stage5)
-    if not clauses or (not gt_laws and not gt_cases):
-        return None
-    prefix = "case" if source_type == "case_law" else source_type
-    return {
-        "id": f"{prefix}_{source_id}",
-        "source_type": source_type,
-        "source_id": source_id,
-        "source_text": source_text,
-        "clauses": clauses,
-        "gt_laws": sorted(gt_laws),
-        "gt_cases": sorted(gt_cases),
-        "meta": meta,
-    }
 
 
 def stage_clauses(
@@ -1298,7 +1136,7 @@ def run_project_reranking(
             rec["rank"] = new_rank
         dense_map[clause_text] = sorted_records
 
-    reranked_groups = project_reranker.run_rrf(bm25_map, dense_map, project_reranker.K, top_k)
+    reranked_groups = rrf_baseline.run_rrf(bm25_map, dense_map, rrf_baseline.K, top_k)
     reranked_results: list[dict[str, Any]] = []
     for group in reranked_groups:
         clause_index = int(group["index"])

@@ -1,10 +1,7 @@
-import argparse
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
-from pathlib import Path
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, field_validator
@@ -13,14 +10,12 @@ from vertexai.generative_models import GenerativeModel, GenerationConfig
 
 load_dotenv()
 
-# ── Vertex AI 초기화 ──────────────────────────────────────────────
 PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 LOCATION = os.getenv("GCP_LOCATION")
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
-MODEL_NAME = "gemini-2.5-pro"
-
-# ── 공통 특약 (special_terms 인덱스 0~5) ─────────────────────────
+MODEL_NAME_FLASH = "gemini-2.5-flash"
+MODEL_NAME_FLASH_LITE = "gemini-2.5-flash-lite"
 COMMON_TERMS_COUNT = 6
 
 # ── Pydantic 스키마 ──────────────────────────────────────────────
@@ -29,64 +24,44 @@ class LawType(str, Enum):
     law  = "법령"
     case = "판례"
 
-class RelatedLaw(BaseModel):
-    """최종 출력 스키마 - RAG에서 구성, summary만 LLM 생성"""
-    type: LawType | None = None
-    ref: str | None = None       # RAG doc_id
-    summary: str | None = None   # LLM 생성
-    content: str | None = None   # RAG 원문
-
-class RelatedClause(BaseModel):
-    clause_id: str | None = None
-    clause_text: str | None = None
-    relation: str | None = None
-
-# LLM이 반환하는 중간 스키마
-# - ref: RAG doc_id 그대로 (LLM이 생성하지 않음, 프롬프트에서 제시한 식별자 그대로 반환)
-# - summary: 일반인 눈높이 설명 (LLM 생성)
 class SelectedLaw(BaseModel):
     ref: str | None = None
     summary: str | None = None
+    is_violation: bool = False
+    is_caution: bool = False
 
-class ClauseLLMOutput(BaseModel):
-    selected_laws: list[SelectedLaw] = []   # 관련 있는 것만, 연관도 높은 순
-    related_clauses: list[RelatedClause] = []
+    @field_validator("is_violation", "is_caution", mode="before")
+    @classmethod
+    def coerce_bool(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes")
+        return bool(v) if v is not None else False
 
-    @field_validator("selected_laws", "related_clauses", mode="before")
+class ClauseSummaryOutput(BaseModel):
+    clause_one_line_summary: str = ""
+    clause_interpretation: str = ""
+    selected_laws: list[SelectedLaw] = []
+
+    @field_validator("clause_one_line_summary", "clause_interpretation", mode="before")
+    @classmethod
+    def coerce_str(cls, v):
+        if v is None:
+            return ""
+        if isinstance(v, list):
+            return "\n".join(f"• {item.lstrip('•- ').strip()}" for item in v if item)
+        return str(v)
+
+    @field_validator("selected_laws", mode="before")
     @classmethod
     def coerce_list(cls, v):
         if v is None:
             return []
         return v
 
-    @field_validator("related_clauses", mode="after")
-    @classmethod
-    def split_combined_clause_ids(cls, v):
-        """
-        LLM이 "공통특약 1, 2" 또는 "특약1, 특약2"처럼 여러 특약을 하나로 합친 경우
-        별도 항목으로 분리. clause_text는 합쳐진 텍스트라 신뢰 불가 → None 처리.
-        relation은 그대로 이어받음.
-        """
-        result = []
-        for item in v:
-            clause_id = item.clause_id or ""
-            ids = [x.strip() for x in clause_id.split(",") if x.strip()]
-            if len(ids) > 1:
-                for cid in ids:
-                    result.append(RelatedClause(
-                        clause_id=cid,
-                        clause_text=None,
-                        relation=item.relation,
-                    ))
-            else:
-                result.append(item)
-        return result
-
-class ClauseResult(BaseModel):
+class RelatedClause(BaseModel):
     clause_id: str | None = None
     clause_text: str | None = None
-    related_laws: list[RelatedLaw] = []
-    related_clauses: list[RelatedClause] = []
+    relation: str | None = None
 
 class ChecklistItem(BaseModel):
     item: str | None = None
@@ -102,22 +77,236 @@ class ChecklistItem(BaseModel):
             return [x.strip() for x in v.split(",") if x.strip()]
         return v
 
-class ReportOutput(BaseModel):
+class FinalReportOutput(BaseModel):
     contract_checklist: list[ChecklistItem] = []
-    clause_results: list[ClauseResult] = []
+    related_clauses_map: dict[str, list[RelatedClause]] = {} # clause_id -> list of relations
 
-class ChecklistOutput(BaseModel):
+class LLMRelatedClauseResult(BaseModel):
+    clause_id: str
+    related_clauses: list[RelatedClause] = []
+
+    @field_validator("related_clauses", mode="after")
+    @classmethod
+    def split_combined_clause_ids(cls, v):
+        result = []
+        for item in v:
+            c_id = item.clause_id or ""
+            ids = [x.strip() for x in c_id.split(",") if x.strip()]
+            if len(ids) > 1:
+                for cid in ids:
+                    result.append(RelatedClause(
+                        clause_id=cid,
+                        clause_text=None,
+                        relation=item.relation,
+                    ))
+            else:
+                result.append(item)
+        return result
+
+class FinalReportLLMOutput(BaseModel):
     contract_checklist: list[ChecklistItem] = []
+    clause_relations: list[LLMRelatedClauseResult] = []
 
 # ── 프롬프트 ──────────────────────────────────────────
+
 SYSTEM_PROMPT = """[역할 및 지시]
 당신은 주택임대차 계약 검토를 도와줄 법률 전문가입니다.
 아래 정보를 바탕으로 임차인이 계약 전 스스로 확인해야 할 사항을 도출하세요.
 
 - 특약 문구의 해석 가능성, 법령과의 관계, 분쟁으로 이어질 수 있는 사실관계를 객관적으로 서술하세요.
 - 명백히 법령에 위반되는 경우에는 해당 법령 조문을 근거로 위반 사실을 서술합니다.
-- "위험", "유리", "불리" 등의 평가적 표현은 사용하지 마세요.
+- "위험", "유리", "불리" 등의 평가적 표현은 절대 사용하지 마세요."""
 
+def format_laws(matches: list) -> str:
+    lines = []
+    for m in matches:
+        text = m.get("content") or m.get("doc_text") or m.get("summary") or ""
+        if not text:
+            continue
+        doc_id = m.get("doc_id", "")
+        lines.append(f"[{doc_id}]\n{text}")
+    return "\n\n".join(lines) if lines else "해당 없음"
+
+def format_precs(matches: list) -> str:
+    lines = []
+    for m in matches:
+        text = m.get("content") or m.get("summary") or ""
+        if not text or text == "nan":
+            continue
+        doc_id = m.get("doc_id", "")
+        lines.append(f"[{doc_id}]\n{text}")
+    return "\n\n".join(lines) if lines else "해당 없음"
+
+def format_property_info(property_info: dict) -> str:
+    return json.dumps(property_info, ensure_ascii=False, indent=2)
+
+def build_clause_summary_prompt(
+    target_clause: str,
+    laws: list,
+    precs: list,
+) -> str:
+    all_doc_ids = [m.get("doc_id", "") for m in laws + precs if m.get("doc_id")]
+    output_format = json.dumps(
+        {
+            "clause_one_line_summary": "이 특약은 ... 한다는 내용입니다. (20자 내외 한 문장)",
+            "clause_interpretation": "- 이 특약의 핵심 의미는 ...\n- 임차인 입장에서 주의할 점은 ...\n- 관련 법령에 따르면 ...",
+            "selected_laws": [
+                {
+                    "ref": "<위 목록의 doc_id 그대로>",
+                    "summary": "<is_violation 또는 is_caution이 true면 첫 줄 한 문장 요약 + 빈 줄 + 마크다운 상세 설명 / 둘 다 false면 빈 문자열>",
+                    "is_violation": False,
+                    "is_caution": False
+                }
+            ]
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    return f"""
+[분석 대상 특약]
+{target_clause}
+
+[관련 법령]
+{format_laws(laws)}
+
+[관련 판례]
+{format_precs(precs)}
+
+[출력 지시]
+위 분석 대상 특약을 검토하여 아래 JSON 형식으로만 응답하세요.
+
+- clause_one_line_summary: 이 특약 전체를 **한 문장**으로 요약하세요.
+  · 법률 지식이 없는 일반인이 바로 이해할 수 있도록 쉽고 간결하게 작성하세요.
+  · 20자 내외, 마침표로 끝내세요. 마크다운 기호는 사용하지 마세요.
+  · 예시: "임차인이 먼저 퇴실하면 남은 기간 임대료를 부담해야 합니다."
+
+- clause_interpretation: 이 특약이 의미하는 바를 법률 지식이 없는 일반인도 이해할 수 있도록 쉬운 말로 바꿔 설명하세요.
+  · 반드시 제공된 [관련 법령]·[관련 판례]를 근거로 설명하세요. 외부 지식을 사용하지 마세요.
+  · 어떤 상황에서 어떤 권리가 보호되거나 제한될 수 있는지, 임차인이 실제로 알아야 할 핵심만 담으세요.
+  · **말투는 "~했음.", "~임.", "~가능함." 형식의 개조식**으로 작성하세요. "~합니다", "~세요", "~해요" 형식은 사용하지 마세요.
+  · **법률 전문 용어는 반드시 괄호 안에 풀어쓰세요.** 예) 묵시적 갱신(계약 만료 후 아무 말 없이 자동으로 계약이 연장되는 것), 중개보수(부동산 중개업소에 내는 수수료), 대항력(집이 팔려도 계속 살 수 있는 권리), 보증금반환청구권(계약 끝날 때 맡긴 돈을 돌려달라고 요구할 수 있는 권리)
+  · 특약 원문을 그대로 반복하지 마세요.
+  · **마크다운 형식**으로 작성하세요. `#`, `##` 등 제목 기호는 절대 사용하지 마세요.
+  · `- ` 불릿 포인트로 2~4개 항목을 작성하세요.
+  · **불릿 하나에 반드시 한 문장만** 작성하세요. 두 문장 이상이면 별도 불릿으로 분리하세요.
+    형식 예시:
+    - 이 특약의 핵심 의미는 ...입니다.
+    - 묵시적 갱신(계약 만료 후 아무 말 없이 자동으로 연장되는 것)이 되면 ...할 수 있습니다.
+    - 관련 법령에 따르면 ...
+
+- selected_laws: [관련 법령]과 [관련 판례] 중 이 특약과 **직접적으로 관련 있는 상위 3개 이내**만 골라 작성하세요.
+  *   **주의**: 제공된 리스트에 없는 항목을 외부 지식으로 생성하지 마세요. 반드시 식별자({', '.join(all_doc_ids)})만 사용하세요.
+  *   **주의**: 연관성이 낮거나 단순히 용어가 겹치는 항목은 제외하세요. 정말 관련 있는 항목이 없으면 빈 배열([])을 반환하세요.
+
+  is_violation / is_caution 판단 기준 (반드시 제공된 법령·판례 내용만 근거로 판단하세요):
+    · **is_violation**: 특약 내용이 제공된 법령의 **강행규정(임차인에게 불리한 약정은 효력이 없다는 규정 등)**에 명백히 위배되거나, 제공된 판례상 임차인의 권리를 부당하게 제한한다고 판단된 사례와 유사하면 `true`. 단순 절차 안내이거나 상호 합의 가능한 범위이면 `false`.
+    · **is_caution**: is_violation이 `false`이더라도, 제공된 법령·판례를 근거로 볼 때 임차인 또는 임대인 중 한쪽에게 실질적으로 불리하게 작용할 가능성이 있으면 `true`. 양쪽 모두에게 중립적이면 `false`.
+    · is_violation이 `true`이면 is_caution은 `false`로 설정하세요 (위배가 더 상위 개념).
+
+  summary 작성 요령:
+    · **모든 summary에서 불릿 하나에 반드시 한 문장만** 작성하세요. 두 문장 이상이면 별도 불릿으로 분리하세요.
+    · **말투는 "~했음.", "~임.", "~가능함." 형식의 개조식**으로 작성하세요. "~합니다", "~세요", "~해요" 형식은 사용하지 마세요.
+    · **법률 전문 용어는 반드시 괄호 안에 풀어쓰세요.** 예) 묵시적 갱신(계약 만료 후 자동 연장), 중개보수(부동산 수수료), 강행규정(당사자가 바꿀 수 없는 법 조항)
+    · **법령(관련 법령 섹션 항목)**:
+        · is_violation 또는 is_caution이 `true`인 경우: 반드시 아래 **두 부분**으로 구성하세요. `#`, `##` 기호는 사용하지 마세요.
+          1. **첫 번째 줄**: 왜 문제가 되는지(위배) 일반인이 바로 이해할 수 있는 한 문장 요약
+          2. **빈 줄 하나** 삽입
+          3. **이후 내용**: 구체적인 이유, 근거 조항, 임차인/임대인이 주장할 수 있는 권리를 `- ` 불릿으로 서술 (불릿 하나 = 한 문장)
+        · is_violation과 is_caution 모두 `false`인 경우: 빈 문자열("")을 반환하세요.
+    · **판례(관련 판례 섹션 항목)**:
+        · is_violation이 `true`인 경우: 법령과 동일하게 아래 **두 부분**으로 구성하세요.
+          1. **첫 번째 줄**: 이 판례가 이 특약과 어떻게 충돌하는지 일반인이 바로 이해할 수 있는 한 문장 요약
+          2. **빈 줄 하나** 삽입
+          3. **이후 내용**: `- ` 불릿으로 아래 항목 서술 (불릿 하나 = 한 문장)
+             - **사건 개요**: 어떤 분쟁이었는지 한 문장으로 요약함.
+             - **법원 판단**: 법원이 어떻게 결론 내렸는지 한 문장으로 씀.
+             - **이 특약과의 관련성**: 왜 이 특약에서 주의해야 하는지 한 문장으로 씀.
+        · is_violation이 `false`인 경우: 빈 줄 없이 바로 `- ` 불릿으로 작성하세요. (불릿 하나 = 한 문장)
+          - **사건 개요**: 어떤 분쟁이었는지 한 문장으로 요약함.
+          - **법원 판단**: 법원이 어떻게 결론 내렸는지 한 문장으로 씀.
+          - **이 특약과의 관련성**: 왜 이 특약에서 주의해야 하는지 한 문장으로 씀.
+
+- JSON 외 텍스트, 마크다운 코드블록은 포함하지 마세요.
+
+{output_format}
+"""
+
+def build_final_report_prompt(
+    property_info: dict,
+    common_terms: list,
+    target_terms_with_summaries: list[dict],
+) -> str:
+    common_text = "\n".join([f"공통특약 {i+1}: {t}" for i, t in enumerate(common_terms)])
+    
+    target_text_parts = []
+    for item in target_terms_with_summaries:
+        idx = item['index'] - COMMON_TERMS_COUNT + 1
+        clause_id = f"특약{idx}"
+        target_text_parts.append(f"[{clause_id}]\n원문: {item['clause']}")
+        if item.get('summaries'):
+            target_text_parts.append("법적 해석 요약:")
+            for s in item['summaries']:
+                target_text_parts.append(f"- {s['ref']}: {s['summary']}")
+        target_text_parts.append("")
+    
+    target_text = "\n".join(target_text_parts)
+
+    output_format = json.dumps(
+        {
+            "contract_checklist": [
+                {"item": None, "description": None, "basis": None}
+            ],
+            "clause_relations": [
+                {
+                    "clause_id": "<특약1 등>",
+                    "related_clauses": [
+                        {"clause_id": "<특약2 또는 공통특약 1>", "clause_text": None, "relation": "<관계 설명>"}
+                    ]
+                }
+            ]
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    return f"""
+[계약서 정보]
+{format_property_info(property_info)}
+
+[공통 특약]
+{common_text}
+
+[타겟 특약 전체 및 법적 해석]
+{target_text}
+
+[출력 지시]
+위 계약서 전체와 개별 특약의 법적 해석을 바탕으로 다음 두 가지를 도출하여 JSON 형식으로만 응답하세요.
+
+1. contract_checklist: 임차인이 계약 전 확인해야 할 통합 체크리스트
+- 입력된 모든 특약을 종합 검토한 후, 확인 항목을 통합하여 작성하세요.
+- 계약서 전체 맥락에서 중요한 확인 사항을 도출하세요.
+- **주의**: 모든 인덱스는 1부터 시작합니다. **`특약0`은 존재하지 않으며 절대 사용하지 마세요.**
+- description: 법률 지식이 없는 일반인이 이해할 수 있도록 **쉬운 말**로 작성하세요.
+  · `- ` 불릿 포인트로 2~3개 항목으로 간결하게 정리하세요.
+  · `#`, `##` 등 제목 기호는 절대 사용하지 마세요.
+  · **불릿 하나에 반드시 한 문장만** 작성하세요. 두 문장 이상이면 별도 불릿으로 분리하세요.
+  · **말투는 "~했음.", "~임.", "~가능함." 형식의 개조식**으로 작성하세요. "~합니다", "~세요", "~해요" 형식은 사용하지 마세요.
+  · **법률 전문 용어는 반드시 괄호 안에 풀어쓰세요.** 예) 묵시적 갱신(계약 만료 후 자동 연장), 중개보수(부동산 수수료)
+  · 예시:
+    - 계약 전 임대인과 수선 범위를 명확히 합의하고 계약서에 기재해 두세요.
+    - 퇴거 시 분쟁 방지를 위해 입주 시 상태를 사진으로 기록해 두세요.
+- basis: 이 체크리스트 항목의 근거가 되는 특약 ID(예: "특약1", "공통특약 1")와 법령/판례 ref를 배열로 나열하세요. 반드시 본문에 등장한 식별자만 정확히 사용해야 합니다.
+
+2. clause_relations: 특약 간의 연관성 분석 (특약 vs 특약)
+- [타겟 특약 전체]와 [공통 특약] 중 서로 동시에 적용될 때 확인이 필요하거나 충돌할 가능성이 있는 **특약들끼리의 관계(Agreement-to-Agreement)**를 분석하세요.
+- **주의**: `특약0`은 절대 사용하지 마세요. 모든 식별자는 1번부터 시작합니다.
+- **주의**: 법령이나 판례와 특약의 관계는 이미 개별 요약에 포함되어 있으므로, 여기서는 절대 다루지 마세요. `clause_id`에 법령 식별자(예: 민법 제00조)를 넣는 것은 엄격히 금지됩니다.
+- `clause_id`들은 반드시 제공된 "특약1", "특약2", "공통특약 1" 형태의 식별자만 사용하세요.
+- **주의**: 각 특약의 원문 내용을 다른 특약 번호와 절대 혼동하지 마세요. 반드시 제공된 ID와 그에 해당하는 원문 내용을 정확히 매칭하여 분석하세요.
+- relation은 두 조항이 어떻게 연관되어 있으며 왜 주의해야 하는지 일반인 눈높이에서 **마크다운 형식**(`- ` 불릿)으로 설명하세요. `#`, `##` 기호는 사용하지 마세요. **불릿 하나에 반드시 한 문장만** 작성하고, **말투는 "~했음.", "~임." 개조식**으로, 법률 전문 용어는 괄호 안에 풀어쓰세요.
+- 연관성이 있는 특약에 대해서만 배열에 추가하세요.
+- clause_text는 null로 두세요.
 
 [출력 형식 예시]
 아래는 특약 4개가 하나의 계약서에 함께 존재하는 경우의 출력 예시입니다.
@@ -131,323 +320,29 @@ SYSTEM_PROMPT = """[역할 및 지시]
 특약C: "계약 갱신 시 임대료 인상률은 당사자 간 협의로 정하며 별도 제한을 두지 않는다."
 특약D: "임차인은 계약 만료 시 계약갱신을 요구하지 않기로 한다."
 
-[출력 예시]
+[출력 예시 JSON 내부 구조]
+"contract_checklist": [
+  {{
+    "item": "원상복구 범위 및 귀책 기준 확인",
+    "description": "- 계약 전 임대인과 원상복구 범위를 구체적으로 합의하고 계약서에 기재해 두세요.\n- 입주 시 내부 상태를 사진·영상으로 기록해두면 퇴거 시 분쟁을 예방할 수 있어요.",
+    "basis": ["특약A"]
+  }}
+],
+"clause_relations": [
+  {{
+    "clause_id": "특약A",
+    "related_clauses": [
+      {{
+        "clause_id": "특약B",
+        "clause_text": null,
+        "relation": "수선의무 부담 특약이 함께 존재하는 경우, 임차인이 임차 기간 중 자비로 수선한 부분이 퇴거 시 원상복구 대상에 해당하는지 여부가 불명확해집니다. 임차인이 수선 비용을 이미 부담한 부분에 대해 추가로 원상복구 비용까지 청구될 수 있는지를 두 조항을 함께 확인합니다."
+      }}
+    ]
+  }}
+]
+---
 
-contract_checklist:
-  - item: "원상복구 범위 및 귀책 기준 확인"
-    description: "원상복구 의무의 범위는 임대 당시 목적물의 상태, 계약 체결 경위,
-                  임차인이 수리하거나 변경한 내용 등을 개별적으로 고려하여 정해집니다.
-                  계약 체결 전 또는 입주 시 임차 목적물의 현재 상태를 사진이나
-                  영상으로 기록하고, 하자 부위를 계약서에 명기해 두면 퇴거 시
-                  귀책 여부를 확인하는 근거로 활용할 수 있습니다."
-
-  - item: "수선의무 면제 범위 명시 여부 확인"
-    description: "특약으로 임대인의 수선의무를 면제하더라도 면제 범위가
-                  명시되지 않은 경우, 임차인의 수선 부담은 통상 생길 수 있는
-                  소규모 파손에 한하는 것으로 해석될 수 있습니다.
-                  계약서에 임차인 부담 수선의 구체적 범위(예: 문손잡이 교체,
-                  형광등 교체 등 소모품 수준)가 기재되어 있는지 확인합니다."
-
-  - item: "난방·배관·전기 등 핵심 설비 수선 주체 확인"
-    description: "난방시설, 배관, 전기설비 등은 임차인이 별 비용 없이 손쉽게
-                  고칠 수 있는 소규모 파손으로 보기 어렵습니다.
-                  이러한 설비에 결함이 발생할 경우 수선 주체가 누구인지를
-                  계약서 또는 임대인과의 서면 확인을 통해 명확히 합니다."
-
-  - item: "계약갱신 방식(합의갱신·요구권 행사) 구분 확인"
-    description: "임대료 인상 상한 5% 규정은 임차인이 계약갱신요구권을 행사하는
-                  경우에 적용됩니다. 임차인이 갱신요구권을 행사하지 않고 임대인과
-                  합의하여 새로운 계약을 체결하는 경우에는 5%를 초과하는 인상이
-                  가능합니다. 이번 갱신이 어떤 방식으로 이루어지는지를 계약서
-                  문언과 당사자 의사를 통해 확인합니다."
-
-  - item: "증액 청구 가능 시점 확인"
-    description: "증액 청구는 임대차계약 또는 약정한 차임·보증금의 증액이 있은 후
-                  1년 이내에는 할 수 없습니다. 직전 증액 시점으로부터 1년이
-                  경과하였는지를 계약서 상의 날짜를 통해 확인합니다."
-
-  - item: "계약갱신요구권 행사 가능 기간 확인"
-    description: "계약갱신요구권은 임대차기간이 끝나기 6개월 전부터 2개월 전까지의
-                  기간에 행사할 수 있습니다. 이 기간을 놓치면 해당 계약에서는
-                  갱신요구권을 행사할 수 없게 됩니다. 계약 만료일을 기준으로
-                  행사 가능 기간의 시작일과 종료일을 계산하여 확인합니다."
-
-  - item: "갱신요구권 행사 방식 확인"
-    description: "계약갱신요구권은 구두, 문자메시지, 이메일 등 방식에 제한이 없으나,
-                  추후 분쟁 발생 시 행사 사실을 입증하기 위해 내용증명 우편 등
-                  증거를 남길 수 있는 방법으로 행사하는 방법을 확인합니다."
-
-
-clause_results:
-  - clause_id: "특약A 해당 ID"
-    clause_text: "임차인 퇴거 시 모든 원상복구 비용은 임차인이 전액 부담한다."
-    related_clauses:
-      - clause_id: "특약B 해당 ID"
-        clause_text: "임차 기간 중 발생하는 모든 수리 및 수선은 임차인이 부담한다."
-        relation: "수선의무 부담 특약이 함께 존재하는 경우, 임차인이 임차 기간 중
-                   자비로 수선한 부분이 퇴거 시 원상복구 대상에 해당하는지 여부가
-                   불명확해집니다. 임차인이 수선 비용을 이미 부담한 부분에 대해
-                   추가로 원상복구 비용까지 청구될 수 있는지를 두 조항을 함께
-                   확인합니다."
-                   
-
-  - clause_id: "특약B 해당 ID"
-    clause_text: "임차 기간 중 발생하는 모든 수리 및 수선은 임차인이 부담한다."
-    related_clauses:
-      - clause_id: "특약A 해당 ID"
-        clause_text: "임차인 퇴거 시 모든 원상복구 비용은 임차인이 전액 부담한다."
-        relation: "원상복구 비용 부담 특약이 함께 존재하는 경우, 임차 기간 중
-                   임차인이 수선한 부분을 퇴거 시 원상복구 대상으로 볼 것인지에 대해
-                   두 조항의 적용 범위가 중첩될 수 있습니다. 수선 이후 목적물의
-                   상태 변화가 원상복구 의무의 기준이 되는지를 함께 확인합니다."
-
-
-  - clause_id: "특약C 해당 ID"
-    clause_text: "계약 갱신 시 임대료 인상률은 당사자 간 협의로 정하며 별도 제한을 두지 않는다."
-    related_clauses:
-      - clause_id: "특약D 해당 ID"
-        clause_text: "임차인은 계약 만료 시 계약갱신을 요구하지 않기로 한다."
-        relation: "계약갱신요구권 포기 특약이 함께 존재하는 경우, 임차인이
-                   합의갱신 방식으로만 계약을 연장하게 되어 임대료 인상 제한(5%)
-                   규정이 적용되지 않을 수 있습니다. 갱신 방식에 따라 임대료
-                   결정 방식이 달라지는지를 두 조항을 함께 확인합니다."
-
-
-  - clause_id: "특약D 해당 ID"
-    clause_text: "임차인은 계약 만료 시 계약갱신을 요구하지 않기로 한다."
-    related_clauses:
-      - clause_id: "특약C 해당 ID"
-        clause_text: "계약 갱신 시 임대료 인상률은 당사자 간 협의로 정하며 별도 제한을 두지 않는다."
-        relation: "임대료 인상 관련 특약이 함께 존재하는 경우, 계약갱신요구권을
-                   행사하지 못하게 되면 합의갱신 방식으로만 계약이 연장되어
-                   임대료 인상 상한(5%) 규정이 적용되지 않을 수 있습니다.
-                   갱신 방식에 따라 임대료 결정 구조가 달라지는지를 두 조항을
-                   함께 확인합니다." """
-
-
-def load_json(path: str) -> dict | list:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def build_rrf_index(law_list: list, prec_list: list) -> dict:
-    """rrf 결과를 타겟 특약 index 기준으로 딕셔너리화"""
-    index = {}
-    for item in law_list:
-        idx = item["index"]
-        index.setdefault(idx, {"laws": [], "precs": []})
-        index[idx]["laws"] = item.get("top_matches", [])
-    for item in prec_list:
-        idx = item["index"]
-        index.setdefault(idx, {"laws": [], "precs": []})
-        index[idx]["precs"] = item.get("top_matches", [])
-    return index
-
-
-def format_property_info(property_info: dict) -> str:
-    return json.dumps(property_info, ensure_ascii=False, indent=2)
-
-
-def format_common_terms(common_terms: list) -> str:
-    lines = []
-    for i, term in enumerate(common_terms):
-        lines.append(f"공통특약 {i+1}: {term}")
-    return "\n".join(lines)
-
-
-def format_other_target_terms(target_terms: list, exclude_idx: int) -> str:
-    """타겟 특약 중 현재 분석 대상을 제외한 나머지"""
-    lines = []
-    for i, term in enumerate(target_terms):
-        if i == exclude_idx:
-            continue
-        lines.append(f"특약{i+1}: {term}")
-    return "\n".join(lines) if lines else "없음"
-
-
-def format_laws(matches: list) -> str:
-    """LLM 프롬프트용 - 대괄호 안에 doc_id를 노출해 LLM이 그대로 ref로 쓰도록 함"""
-    lines = []
-    for m in matches:
-        text = m.get("content") or m.get("doc_text") or m.get("summary") or ""
-        if not text:
-            continue
-        doc_id = m.get("doc_id", "")
-        lines.append(f"[{doc_id}]\n{text}")
-    return "\n\n".join(lines) if lines else "해당 없음"
-
-
-def format_precs(matches: list) -> str:
-    """LLM 프롬프트용 - 대괄호 안에 doc_id를 노출해 LLM이 그대로 ref로 쓰도록 함"""
-    lines = []
-    for m in matches:
-        text = m.get("content") or m.get("summary") or ""
-        if not text or text == "nan":
-            continue
-        doc_id = m.get("doc_id", "")
-        lines.append(f"[{doc_id}]\n{text}")
-    return "\n\n".join(lines) if lines else "해당 없음"
-
-
-def dedup_related_clauses(clause_results: list[dict]) -> list[dict]:
-    """
-    A→B, B→A 중복 제거. 먼저 등장한 쌍만 유지.
-    """
-    seen: set[frozenset] = set()
-    for cr in clause_results:
-        cid = cr.get("clause_id", "")
-        deduped = []
-        for rel in cr.get("related_clauses") or []:
-            other_id = rel.get("clause_id", "")
-            pair: frozenset = frozenset([cid, other_id])
-            if pair not in seen:
-                seen.add(pair)
-                deduped.append(rel)
-        cr["related_clauses"] = deduped
-    return clause_results
-
-
-def load_from_rag_result(rag_path: str) -> tuple[dict, list, list]:
-    """
-    RAG 결과 JSON을 읽어 (property_info, common_terms, clauses_with_hits) 반환.
-
-    신규 포맷: clauses[].law_results / clauses[].prec_results 분리
-    구버전 포맷: clauses[].top_results (source_type 필드로 구분) — 하위 호환 유지
-
-    clauses_with_hits 각 항목:
-        {
-            "index":   int,        # 절대 인덱스 (COMMON_TERMS_COUNT+1 ~)
-            "clause":  str,        # 특약 원문
-            "laws":    list[dict], # 법령 검색 결과
-            "precs":   list[dict], # 판례 검색 결과
-        }
-    """
-    data = load_json(rag_path)
-    property_info = data.get("property_info", {})
-    common_terms  = data.get("common_terms", [])
-    clauses_with_hits = []
-    for item in data.get("clauses", []):
-        # 신규 포맷: law_results / prec_results
-        if "law_results" in item or "prec_results" in item:
-            laws  = item.get("law_results", [])
-            precs = item.get("prec_results", [])
-        # 구버전 포맷: top_results + source_type 필터
-        else:
-            laws  = [r for r in item.get("top_results", []) if r.get("source_type") == "law"]
-            precs = [r for r in item.get("top_results", []) if r.get("source_type") == "precedent"]
-        clauses_with_hits.append({
-            "index":  item["index"],
-            "clause": item["clause"],
-            "laws":   laws,
-            "precs":  precs,
-        })
-    return property_info, common_terms, clauses_with_hits
-
-
-def build_clause_prompt(
-    target_clause: str,
-    clause_label: str,
-    property_info: dict,
-    common_terms: list,
-    other_target_terms: list,
-    exclude_idx: int,
-    laws: list,
-    precs: list,
-) -> str:
-    # 프롬프트에 노출할 doc_id 목록 (LLM이 ref로 그대로 사용)
-    all_doc_ids = [m.get("doc_id", "") for m in laws + precs if m.get("doc_id")]
-    output_format = json.dumps(
-        {
-            "selected_laws": [{"ref": "<위 목록의 doc_id 그대로>", "summary": "<일반인이 이해할 수 있는 설명>"}],
-            "related_clauses": [{"clause_id": None, "clause_text": None, "relation": None}]
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
-
-    return f"""
-[계약서 정보]
-{format_property_info(property_info)}
-
-[공통 특약 (모든 계약서 동일)]
-{format_common_terms(common_terms)}
-
-[기타 특약 목록 (분석 대상 제외)]
-{format_other_target_terms(other_target_terms, exclude_idx)}
-
-[분석 대상 특약 ({clause_label})]
-{target_clause}
-
-[관련 법령]
-{format_laws(laws)}
-
-[관련 판례]
-{format_precs(precs)}
-
-[출력 지시]
-위 분석 대상 특약을 검토하여 아래 JSON 형식으로만 응답하세요.
-
-- selected_laws: [관련 법령]과 [관련 판례] 중 이 특약과 실제로 관련 있는 항목만 골라 연관도 높은 순서로 작성하세요.
-  관련 있는 항목이 없으면 빈 배열로 반환하세요.
-  ref는 반드시 대괄호 안의 식별자({', '.join(all_doc_ids)})를 변형 없이 그대로 사용하세요.
-  summary는 법률 전문 지식이 없는 일반인도 이해할 수 있도록 작성하세요.
-    · 이 법령/판례가 무슨 내용인지 쉬운 말로 설명하고,
-    · 왜 이 특약과 연관되는지 구체적으로 서술하세요.
-    · 전문 용어는 괄호 안에 풀어쓰세요. 예) "대항력(집을 팔아도 계속 살 수 있는 권리)"
-  summary 외에 다른 필드는 생성하지 마세요.
-- related_clauses: [기타 특약 목록]과 [공통 특약] 중 이 특약과 동시에 적용될 때 확인이 필요한 것만 작성하세요. 없으면 빈 배열로 반환하세요.
-  clause_id는 반드시 위 목록에서 보여준 ID를 그대로 사용하세요. (예: "특약1", "특약3", "공통특약 1")
-  "기타 특약", "개별 특약" 등 다른 표현은 절대 사용하지 마세요. null도 허용하지 않습니다.
-  clause_text는 null로 두세요. (자동으로 채워집니다)
-- JSON 외 텍스트, 마크다운 코드블록은 포함하지 마세요.
-
-{output_format}
-"""
-
-def build_checklist_prompt(
-    target_terms: list,
-    clause_results: list,
-    property_info: dict,
-    common_terms: list,
-) -> str:
-    # 각 특약 분석 결과 요약 구성
-    results_summary = json.dumps(clause_results, ensure_ascii=False, indent=2)
-
-    output_format = json.dumps(
-        {
-            "contract_checklist": [
-                {"item": None, "description": None, "basis": None}
-            ]
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
-
-    target_terms_text = "\n".join(
-        [f"특약{i+1}: {t}" for i, t in enumerate(target_terms)]
-    )
-
-    return f"""
-[계약서 정보]
-{format_property_info(property_info)}
-
-[공통 특약]
-{format_common_terms(common_terms)}
-
-[타겟 특약 전체]
-{target_terms_text}
-
-[특약별 분석 결과]
-{results_summary}
-
-[출력 지시]
-위 계약서 전체를 바탕으로 임차인이 계약 전 확인해야 할 통합 체크리스트를 작성하세요.
-- 입력된 모든 특약을 종합 검토한 후, 확인 항목을 통합하여 작성하고 확인 항목이 없는 경우 빈 배열로 반환하세요.
-- 각 특약을 개별적으로 나열하는 것이 아니라, 계약서 전체 맥락에서 중요한 확인 사항을 도출하세요.
-- basis: 이 체크리스트 항목의 근거가 되는 특약 ID와 법령/판례 ref를 함께 나열하세요.
-  (예: ["특약1", "공통특약 2", "민법_제621조_제1항"])
-  반드시 위 [특약별 분석 결과]에 등장한 clause_id 또는 related_laws의 ref 값만 사용하세요. 임의로 만든 법령명은 포함하지 마세요.
-아래 JSON 형식으로만 응답하세요. JSON 외 텍스트, 마크다운 코드블록은 포함하지 마세요.
+JSON 외 텍스트, 마크다운 코드블록은 포함하지 마세요.
 
 {output_format}
 """
@@ -457,25 +352,17 @@ def call_llm(
     prompt: str,
     schema: type[BaseModel] | None = None,
     max_retries: int = 2,
+    model_override: str | None = None,
 ) -> dict | None:
-    """LLM을 호출하고 JSON을 파싱·검증한 결과를 반환.
-
-    Args:
-        prompt: LLM에 전달할 프롬프트 문자열.
-        schema: Pydantic 모델 클래스. 지정 시 응답을 검증 후 반환.
-        max_retries: 일시적 오류(네트워크·파싱) 발생 시 재시도 횟수.
-
-    Returns:
-        파싱된 dict, 또는 최종 실패 시 None.
-    """
     import time
     from json import JSONDecodeError
     from pydantic import ValidationError
 
-    model = GenerativeModel(MODEL_NAME, system_instruction=SYSTEM_PROMPT)
+    model_to_use = model_override if model_override else MODEL_NAME_FLASH
+    model = GenerativeModel(model_to_use, system_instruction=SYSTEM_PROMPT)
     config = GenerationConfig(temperature=0.0, response_mime_type="application/json")
 
-    for attempt in range(1, max_retries + 2):  # 1 + max_retries 번 시도
+    for attempt in range(1, max_retries + 2):
         try:
             response = model.generate_content(prompt, generation_config=config)
             text = response.text.strip()
@@ -494,327 +381,210 @@ def call_llm(
             print(f"  [call_llm] LLM 호출 오류 (시도 {attempt}/{max_retries + 1}): {e}")
 
         if attempt <= max_retries:
-            time.sleep(2 ** attempt)  # 지수 백오프: 2s, 4s
+            time.sleep(2 ** attempt)
 
-    print("  [call_llm] 최대 재시도 횟수 초과 → None 반환")
     return None
 
+from functools import lru_cache
 
-def _pick_fallback_law(
-    clause_label: str,
-    target_clause: str,
-    laws: list[dict],
-    rag_map: dict[str, dict],
-) -> dict | None:
-    """LLM이 related_laws를 아무것도 선택하지 않았을 때,
-    검색된 법령 중 이 특약을 가장 잘 설명할 수 있는 법령 1개를 LLM이 선택.
-    laws 개수에 무관하게 동작.
-    """
-    if not laws:
-        return None
+# ... (imports)
 
-    all_doc_ids = [m.get("doc_id", "") for m in laws if m.get("doc_id")]
+# ... (rest of the file)
+
+@lru_cache(maxsize=1024)
+def generate_clause_summary(target_clause: str, laws_json: str, precs_json: str) -> dict:
+    """1단계: 개별 특약의 법령/판례 요약만 생성 (독립적, 비동기 호출용)"""
+    laws = json.loads(laws_json)
+    precs = json.loads(precs_json)
+
+    prompt = build_clause_summary_prompt(target_clause, laws, precs)
+    result = call_llm(prompt, schema=ClauseSummaryOutput, model_override=MODEL_NAME_FLASH)
+
+    rag_map: dict[str, dict] = {}
+    for m in laws:
+        did = m.get("doc_id", "")
+        if did: rag_map[did] = {"type": LawType.law.value, "ref": did, "content": m.get("content") or m.get("doc_text") or ""}
+    for m in precs:
+        did = m.get("doc_id", "")
+        if did: rag_map[did] = {"type": LawType.case.value, "ref": did, "content": m.get("content") or m.get("summary") or ""}
+
+    related_laws = []
+    clause_one_line_summary = ""
+    clause_interpretation = ""
+    if result:
+        clause_one_line_summary = result.get("clause_one_line_summary") or ""
+        clause_interpretation = result.get("clause_interpretation") or ""
+        covered = set()
+        for sel in result.get("selected_laws", []):
+            ref = (sel.get("ref") or "").strip()
+            if ref in rag_map and ref not in covered:
+                related_laws.append({
+                    **rag_map[ref],
+                    "summary": sel.get("summary") or "",
+                    "is_violation": sel.get("is_violation", False),
+                    "is_caution": sel.get("is_caution", False),
+                })
+                covered.add(ref)
+
+    return {
+        "clause_one_line_summary": clause_one_line_summary,
+        "clause_interpretation": clause_interpretation,
+        "related_laws": related_laws,
+    }
+
+
+def generate_final_report(property_info: dict, common_terms: list, clauses_with_hits_and_summaries: list[dict]) -> FinalReportOutput:
+    """2단계: 전체가 모인 후 통합 체크리스트와 연관성 분석 수행"""
+    prompt = build_final_report_prompt(property_info, common_terms, clauses_with_hits_and_summaries)
+    result = call_llm(prompt, schema=FinalReportLLMOutput, model_override=MODEL_NAME_FLASH)
+    
+    if not result:
+        return FinalReportOutput()
+
+    clause_text_map: dict[str, str] = {}
+    for item in clauses_with_hits_and_summaries:
+        label = f"특약{item['index'] - COMMON_TERMS_COUNT + 1}"
+        clause_text_map[label] = item["clause"]
+    for i, term in enumerate(common_terms):
+        clause_text_map[f"공통특약 {i + 1}"] = term
+
+    relations_map = {}
+    
+    # 중복 제거 로직 포함 (A->B, B->A)
+    seen_pairs = set()
+
+    for cr in result.get("clause_relations", []):
+        cid = cr.get("clause_id")
+        # cid가 실제 특약 목록에 존재하는 유효한 ID인지 검증
+        if not cid or cid not in clause_text_map:
+            continue
+        
+        valid_rels = []
+        for rel in cr.get("related_clauses", []):
+            other_id = rel.get("clause_id")
+            # 상대방 ID도 유효한 특약 ID인지 검증
+            if not other_id or other_id not in clause_text_map:
+                continue
+            
+            pair = frozenset([cid, other_id])
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                rel["clause_text"] = clause_text_map.get(other_id)
+                valid_rels.append(rel)
+        
+        if valid_rels:
+            relations_map[cid] = valid_rels
+
+    # 체크리스트 후처리: 유효하지 않은 basis 필터링 및 텍스트 보정
+    final_checklist = []
+    for item in result.get("contract_checklist", []):
+        # 1. basis 필터링
+        if item.get("basis"):
+            # 유효한 ID(clause_text_map의 키) 또는 법령/판례 형식인 것만 유지
+            valid_basis = [
+                b for b in item["basis"] 
+                if b in clause_text_map or (re.search(r'[법령조항칙]', b) or len(b.split(",")) > 1)
+            ]
+            item["basis"] = [b for b in valid_basis if b != "특약0"] # 특약0은 무조건 제거
+
+        # 2. 설명 문구 보정 (특약0 언급 제거)
+        if item.get("description"):
+            item["description"] = item["description"].replace("특약0", "해당 특약")
+
+        final_checklist.append(item)
+
+    return FinalReportOutput(
+        contract_checklist=final_checklist,
+        related_clauses_map=relations_map
+    )
+
+
+# ── 특약 재작성 ──────────────────────────────────────────
+
+class ClauseRewriteOutput(BaseModel):
+    rewritten_clause: str = ""
+    reason: str = ""
+
+    @field_validator("rewritten_clause", "reason", mode="before")
+    @classmethod
+    def coerce_str(cls, v):
+        if v is None:
+            return ""
+        if isinstance(v, list):
+            return "\n".join(str(x) for x in v if x)
+        return str(v)
+
+
+def generate_clause_rewrite(
+    original_clause: str,
+    violation_laws: list[dict],  # is_violation=True 항목: {ref, content, summary}
+    all_related_laws: list[dict],  # 전체 related_laws: {ref, content, summary, type}
+) -> dict:
+    """위반 가능성이 있는 특약을 법령에 맞게 재작성한다."""
+
+    violation_text = "\n\n".join(
+        f"[{item['ref']}]\n위반 요약: {item.get('summary', '')}\n원문: {item.get('content', '')}"
+        for item in violation_laws
+    ) or "해당 없음"
+
+    reference_text = "\n\n".join(
+        f"[{item['ref']}] ({item.get('type', '')})\n{item.get('content', '')}"
+        for item in all_related_laws
+        if not item.get("is_violation")
+    ) or "해당 없음"
+
     output_format = json.dumps(
-        {"ref": "<위 목록의 doc_id 그대로>", "summary": "<일반인이 이해할 수 있는 설명>"},
+        {
+            "rewritten_clause": "재작성된 특약 전문 (원문과 동일한 형식, 법령에 맞게 수정)",
+            "reason": "- **재작성 이유**:\n  - 원본 특약은 ... 때문에 문제가 됨.\n- **수정한 부분**:\n  - '원문 문구' → '수정 문구'로 변경함.\n- **법적 근거**:\n  - 주택임대차보호법 제○조에 따라 ... 임."
+        },
         ensure_ascii=False,
         indent=2,
     )
 
     prompt = f"""
-[분석 대상 특약 ({clause_label})]
-{target_clause}
+[원본 특약]
+{original_clause}
 
-[검색된 법령 목록]
-{format_laws(laws)}
+[위반 가능성이 있는 법령]
+{violation_text}
+
+[참고 법령·판례]
+{reference_text}
 
 [출력 지시]
-위 특약을 가장 잘 설명할 수 있는 법령 1개를 골라 아래 JSON 형식으로만 응답하세요.
-ref는 반드시 대괄호 안의 식별자({', '.join(all_doc_ids)})를 변형 없이 그대로 사용하세요.
-summary는 법률 전문 지식이 없는 일반인도 이해할 수 있도록 작성하세요.
-  · 이 법령이 무슨 내용인지 쉬운 말로 설명하고,
-  · 왜 이 특약과 연관되는지 구체적으로 서술하세요.
-  · 전문 용어는 괄호 안에 풀어쓰세요. 예) "대항력(집을 팔아도 계속 살 수 있는 권리)"
-JSON 외 텍스트, 마크다운 코드블록은 포함하지 마세요.
+위 원본 특약이 위반 가능성이 있는 법령에 위배됩니다.
+법령을 준수하면서도 특약의 본래 의도를 최대한 살려 재작성하세요.
+
+- rewritten_clause: 재작성된 특약 전문을 작성하세요.
+  · 원본 특약과 동일한 문체(구어체/문어체)를 유지하세요.
+  · 법령 위반 소지가 있는 문구만 수정하고, 나머지는 원문을 최대한 유지하세요.
+  · 마크다운 기호는 사용하지 마세요. 특약 원문 형식 그대로 작성하세요.
+
+- reason: 재작성 이유를 아래 **중첩 불릿 구조**로 작성하세요.
+  · `#`, `##` 제목 기호는 사용하지 마세요.
+  · 최상위 불릿 3개: **재작성 이유**, **수정한 부분**, **법적 근거** (볼드 처리)
+  · 각 최상위 불릿 아래에 들여쓰기(`  - `)로 세부 내용을 작성하세요.
+  · **들여쓰기 불릿 하나에 반드시 한 문장만** 작성하세요. 두 문장 이상이면 별도 불릿으로 분리하세요.
+  · **말투는 "~했음.", "~임.", "~가능함." 형식의 개조식**으로 작성하세요.
+  · **독자는 법률 지식이 전혀 없는 일반인**임을 항상 염두에 두고, 중학생도 이해할 수 있는 쉬운 말로 작성하세요.
+  · **법률 전문 용어는 반드시 괄호 안에 일상 언어로 풀어쓰세요.** 예) 강행규정(법으로 정해져 있어서 당사자가 마음대로 바꿀 수 없는 조항), 계약갱신청구권(세입자가 "계약을 한 번 더 연장해 달라"고 요구할 수 있는 권리)
+  · 어려운 한자어나 법조문 표현은 쉬운 우리말로 바꾸세요. 예) "위배" → "어긋남", "배제" → "없앰", "준용" → "똑같이 적용"
+  · 형식 예시:
+    - **재작성 이유**:
+      - 원본 특약은 법으로 정해진 규정(당사자가 마음대로 바꿀 수 없는 조항)에 어긋남.
+      - 세입자가 "계약을 한 번 더 연장해 달라"고 요구할 수 있는 권리를 빼앗는 내용임.
+    - **수정한 부분**:
+      - '임차인은 계약 만료 시 갱신을 요구하지 않는다' → '임차인은 법이 허용하는 범위 안에서 갱신을 요청할 수 있다'로 바꿈.
+    - **법적 근거**:
+      - 주택임대차보호법 제6조의3에 따르면, 세입자의 계약 연장 요구 권리는 특약으로 없앨 수 없음.
+
+- JSON 외 텍스트, 마크다운 코드블록은 포함하지 마세요.
 
 {output_format}
 """
-    result = call_llm(prompt, schema=SelectedLaw)
-    if result:
-        ref = (result.get("ref") or "").strip()
-        if ref in rag_map:
-            return {**rag_map[ref], "summary": result.get("summary")}
 
-    # LLM 재시도도 실패하면 진짜 마지막 수단: RAG 1순위 법령
-    did = laws[0].get("doc_id", "")
-    if did and did in rag_map:
-        return {**rag_map[did], "summary": None}
-    return None
-
-
-def generate_report_from_data(property_info: dict, common_terms: list, clauses_with_hits: list) -> ReportOutput:
-    """
-    RAG 결과 데이터를 직접 입력받아 LLM 보고서를 생성하고 반환합니다.
-    API 등에서 파일 I/O 없이 직접 호출할 때 사용합니다.
-    """
-    # 다른 특약 원문 리스트 (관계 분석용)
-    all_target_terms = [c["clause"] for c in clauses_with_hits]
-
-    def _call_one(i: int, item: dict) -> tuple[int, dict | None]:
-        clause_label = f"특약{item['index'] - COMMON_TERMS_COUNT}"
-        print(f"  [{clause_label}] LLM 호출 중...")
-        prompt = build_clause_prompt(
-            target_clause=item["clause"],
-            clause_label=clause_label,
-            property_info=property_info,
-            common_terms=common_terms,
-            other_target_terms=all_target_terms,
-            exclude_idx=i,
-            laws=item["laws"],
-            precs=item["precs"],
-        )
-        # RAG 전체 목록을 doc_id → 항목으로 인덱싱 (type/ref/content는 RAG에서만)
-        rag_map: dict[str, dict] = {}
-        for m in item["laws"]:
-            did = m.get("doc_id", "")
-            if did:
-                rag_map[did] = {
-                    "type":    LawType.law,
-                    "ref":     did,
-                    "content": m.get("content") or m.get("doc_text") or "",
-                }
-        for m in item["precs"]:
-            did = m.get("doc_id", "")
-            if did:
-                rag_map[did] = {
-                    "type":    LawType.case,
-                    "ref":     did,
-                    "content": m.get("content") or m.get("summary") or "",
-                }
-
-        # LLM: 관련 항목 선택(연관도 순) + 일반인 눈높이 summary 생성
-        llm_out = call_llm(prompt, schema=ClauseLLMOutput)
-        if llm_out:
-            # LLM이 선택·정렬한 순서대로 related_laws 구성
-            # ref가 RAG에 존재하는 것만 포함 (환각 방지)
-            related_laws = []
-            covered: set[str] = set()
-            for sel in (llm_out.get("selected_laws") or []):
-                ref = (sel.get("ref") or "").strip()
-                if ref in rag_map and ref not in covered:
-                    related_laws.append({
-                        **rag_map[ref],
-                        "summary": sel.get("summary"),
-                    })
-                    covered.add(ref)
-
-            # LLM이 아무것도 선택하지 않았을 때 → LLM이 직접 최적 법령 1개 선택
-            # (판례만 선택한 경우는 LLM 판단 존중)
-            if not related_laws:
-                print(f"  [{clause_label}] selected_laws 빈 배열 → fallback LLM 호출")
-                fallback = _pick_fallback_law(clause_label, item["clause"], item["laws"], rag_map)
-                if fallback:
-                    related_laws.append(fallback)
-
-            related_clauses = llm_out.get("related_clauses") or []
-            print(f"  [{clause_label}] 완료 (법령 {sum(1 for r in related_laws if r['type']==LawType.law)}개, 판례 {sum(1 for r in related_laws if r['type']==LawType.case)}개)")
-        else:
-            # LLM 완전 실패 시 → fallback LLM으로 최적 법령 1개 선택
-            print(f"  [{clause_label}] LLM 실패 → fallback LLM 호출")
-            fallback = _pick_fallback_law(clause_label, item["clause"], item["laws"], rag_map)
-            related_laws = [fallback] if fallback else []
-            related_clauses = []
-
-        result = {
-            "clause_id":      clause_label,
-            "clause_text":    item["clause"],
-            "related_laws":   related_laws,
-            "related_clauses": related_clauses,
-        }
-        return i, result
-
-    # 특약별 LLM 호출 병렬 실행 후 원래 순서로 정렬
-    clause_results_map: dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=len(clauses_with_hits)) as executor:
-        futures = {executor.submit(_call_one, i, item): i
-                   for i, item in enumerate(clauses_with_hits)}
-        for future in as_completed(futures):
-            i, result = future.result()
-            if result:
-                clause_results_map[i] = result
-
-    clause_results = [clause_results_map[i]
-                      for i in sorted(clause_results_map)]
-
-    # clause_id → clause_text 매핑 테이블 구성 (LLM 환각 방지용 post-processing)
-    # 타겟 특약: "특약1" ~ "특약N"
-    # 공통 특약: "공통특약 1" ~ "공통특약 N"
-    clause_text_map: dict[str, str] = {}
-    for i, item in enumerate(clauses_with_hits):
-        label = f"특약{item['index'] - COMMON_TERMS_COUNT}"
-        clause_text_map[label] = item["clause"]
-    for i, term in enumerate(common_terms):
-        clause_text_map[f"공통특약 {i + 1}"] = term
-
-    # related_clauses의 clause_text를 매핑 테이블 기준으로 채움
-    for cr in clause_results:
-        for rel in cr.get("related_clauses") or []:
-            cid = rel.get("clause_id") or ""
-            if cid in clause_text_map:
-                rel["clause_text"] = clause_text_map[cid]
-            else:
-                rel["clause_text"] = None  # 매핑 실패 시 null 유지
-
-    # A→B / B→A 중복 관계 제거
-    clause_results = dedup_related_clauses(clause_results)
-
-    # ── 체크리스트 생성 ────────────────────────────────────────────
-    print("  [전체 체크리스트] LLM 호출 중...")
-    checklist_result = call_llm(
-        build_checklist_prompt(all_target_terms, clause_results, property_info, common_terms),
-        schema=ChecklistOutput,
-    )
-    contract_checklist = checklist_result.get("contract_checklist", []) if checklist_result else []
-    print("  [전체 체크리스트] 완료")
-
-    return ReportOutput(
-        contract_checklist=contract_checklist,
-        clause_results=clause_results,
-    )
-
-
-def run_from_rag_result(rag_path: str, output_path: str | None = None) -> None:
-    """
-    test_rag_one_contract.py 결과 JSON 하나를 입력받아 보고서 생성.
-
-    사용법:
-        python pipeline/generation/report_generator.py --rag-result path/to/test_rag_104.json
-        python pipeline/generation/report_generator.py --rag-result path/to/test_rag_104.json --output path/to/report.json
-    """
-    print(f"[rag-result 모드] 입력: {rag_path}")
-    property_info, common_terms, clauses_with_hits = load_from_rag_result(rag_path)
-
-    final_output = generate_report_from_data(property_info, common_terms, clauses_with_hits)
-
-    if not output_path:
-        stem = Path(rag_path).stem  # e.g. "test_rag_104"
-        output_path = str(Path(rag_path).parent / f"{stem}_report.json")
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(final_output.model_dump_json(indent=2, exclude_none=False))
-    print(f"  완료. 결과 저장: {output_path}")
-
-
-def run_legacy() -> None:
-    """기존 reranking 파일 기반 처리 (하위 호환)."""
-    base_dir = Path(__file__).resolve().parent
-    project_root = base_dir.parent.parent
-    reranking_dir = project_root / "output" / "reranking"
-
-    law_files = list(reranking_dir.glob("*_reranking_law.json"))
-    for law_file in law_files:
-        prefix = law_file.name.replace("_reranking_law.json", "")
-        caselaw_file = reranking_dir / f"{prefix}_reranking_caselaw.json"
-        contract_file = project_root / "output" / f"{prefix}_contract.json"
-
-        if not caselaw_file.exists():
-            print(f"[{prefix}] caselaw 파일 없음, 건너뜀")
-            continue
-        if not contract_file.exists():
-            print(f"[{prefix}] contract 파일 없음, 건너뜀")
-            continue
-
-        print(f"\n[{prefix}] 처리 시작")
-        contract = load_json(contract_file)
-        law_results = load_json(law_file)
-        prec_results = load_json(caselaw_file)
-
-        property_info = contract["property_info"]
-        special_terms = contract["special_terms"]
-        common_terms  = special_terms[:COMMON_TERMS_COUNT]
-        target_terms  = special_terms[COMMON_TERMS_COUNT:]
-
-        rrf_index = build_rrf_index(law_results, prec_results)
-        clause_results = []
-
-        for i, term in enumerate(target_terms):
-            rrf_idx = i + 1
-            clause_label = f"특약{i+1}"
-            laws  = rrf_index.get(rrf_idx, {}).get("laws", [])
-            precs = rrf_index.get(rrf_idx, {}).get("precs", [])
-
-            print(f"  [{clause_label}] LLM 호출 중...")
-            prompt = build_clause_prompt(
-                target_clause=term,
-                clause_label=clause_label,
-                property_info=property_info,
-                common_terms=common_terms,
-                other_target_terms=target_terms,
-                exclude_idx=i,
-                laws=laws,
-                precs=precs,
-            )
-            result = call_llm(prompt, schema=ClauseResult)
-            if result:
-                clause_results.append(result)
-                print(f"  [{clause_label}] 완료")
-            else:
-                print(f"  [{clause_label}] 실패 - null 반환")
-
-        print(f"  [전체 체크리스트] LLM 호출 중...")
-        checklist_result = call_llm(
-            build_checklist_prompt(target_terms, clause_results, property_info, common_terms),
-            schema=ChecklistOutput,
-        )
-        contract_checklist = checklist_result.get("contract_checklist", []) if checklist_result else []
-        print(f"  [전체 체크리스트] 완료")
-
-        final_output = ReportOutput(
-            contract_checklist=contract_checklist,
-            clause_results=clause_results,
-        )
-        output_path = project_root / "output" / f"{prefix}_report.json"
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(final_output.model_dump_json(indent=2, exclude_none=False))
-        print(f"  [{prefix}] 완료. 결과 저장: {output_path}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="report_generator")
-    parser.add_argument(
-        "--rag-result",
-        type=str,
-        default=None,
-        help="test_rag_*.json 파일 경로 또는 해당 파일들이 들어있는 폴더 경로.",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="출력 JSON 경로 또는 폴더. 파일 지정 시 단일 파일, 폴더 지정 시 해당 폴더에 저장. 미지정 시 입력 파일과 같은 폴더.",
-    )
-    args = parser.parse_args()
-
-    if args.rag_result:
-        rag_path = Path(args.rag_result)
-
-        # 폴더 지정 시 → *_rag.json 또는 test_rag_*.json 전부 처리
-        if rag_path.is_dir():
-            files = sorted(rag_path.glob("*_rag.json")) or sorted(rag_path.glob("test_rag_*.json"))
-            if not files:
-                print(f"[경고] {rag_path} 에서 *_rag.json 파일을 찾을 수 없습니다.")
-                return
-            print(f"[폴더 모드] {len(files)}개 파일 처리 시작")
-            for f in files:
-                out = None
-                if args.output:
-                    out = str(Path(args.output) / f"{f.stem}_report.json")
-                run_from_rag_result(str(f), out)
-        # 파일 지정 시 → 해당 파일만 처리
-        else:
-            run_from_rag_result(str(rag_path), args.output)
-    else:
-        run_legacy()
-
-
-if __name__ == "__main__":
-    main()
+    result = call_llm(prompt, schema=ClauseRewriteOutput, model_override=MODEL_NAME_FLASH)
+    if not result:
+        return {"rewritten_clause": "", "reason": ""}
+    return result

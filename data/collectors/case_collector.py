@@ -4,7 +4,7 @@ import logging
 import urllib.parse
 import requests
 import urllib3
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
