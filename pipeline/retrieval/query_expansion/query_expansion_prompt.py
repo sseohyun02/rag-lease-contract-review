@@ -1,5 +1,7 @@
 from textwrap import dedent
 
+from pipeline.retrieval.query_expansion.law_term_augment import prompt_hint_terms
+
 
 SPECIFICITY_ANCHOR_GUIDE = dedent(
     """
@@ -118,10 +120,65 @@ def build_user_prompt(clause_text: str, extra_instructions: str | None = None) -
     return prompt
 
 
+def _hint_block(clause_text: str) -> str:
+    terms = prompt_hint_terms(clause_text)
+    if not terms:
+        return ""
+    joined = ", ".join(terms)
+    return dedent(
+        f"""
+        [참고 법령용어 - 이 특약에서 발견된 실제 법령 표제어/용어]
+        - 관련되면 legal_issues/keywords/expansion_query에 우선 사용한다. 관련 없으면 무시한다.
+        - 용어: {joined}
+        """
+    ).strip()
+
+
+def _menu_block(issue_menu):
+    """사전에서 특약과 매칭된 제도명 메뉴. LLM이 여기서 우선 고르게 한다."""
+    if not issue_menu:
+        return ""
+    joined = ", ".join(issue_menu)
+    return dedent(
+        f"""
+        [적용 가능 제도명 후보 - 이 특약 유형에서 흔한 법제도]
+        - 아래 후보 중 이 특약에 맞는 것을 legal_issues에 우선 사용한다.
+        - 후보가 특약과 안 맞으면 무시하고, 더 정확한 제도명을 직접 써도 된다.
+        - 후보: {joined}
+        """
+    ).strip()
+
+
+# 명명(命名) 강제: 서술이 아니라 법제도 이름을 legal_issues에 찍게 한다.
+LAW_NAMING_APPEND = dedent(
+    """
+    [핵심 지시 - 법제도 명명(命名)]
+    - 이 특약에 적용되는 '법적 제도/법리'를 그 표준 명칭으로 legal_issues에 반드시 명시한다.
+    - 상황을 풀어 서술하는 데 그치지 말고, 그 상황이 '무슨 제도'인지 이름을 찍는다.
+      예) "대출이 안 되면 계약 무효" -> legal_issues=["정지조건","조건부 법률행위"]
+          "중도 해지 시 비용 부담"   -> legal_issues=["신의성실의 원칙","손해배상액의 예정"]
+          "수리비를 임차인이 부담"     -> legal_issues=["필요비상환청구권","유익비상환청구권"]
+    - 유/무효 등 최종 법률결론은 유보한다. 단, 적용 '제도의 명칭'은 결론이 아니므로 반드시 쓴다.
+
+    [law / dense(expansion_query)]
+    - 적용 제도/법리를 그 표준 명칭과 함께 산문 2~3문장으로 서술한다.
+    - 일상 표현은 변환표에 따라 법령 원문 용어로 바꾼다.
+
+    [law / BM25(keywords)]
+    - legal_issues의 제도명을 포함해, 법령 원문 표제어 중심 구체 명사구 3~7개.
+    - 조문 번호(제N조)/clause_key 형태는 쓰지 않는다. 표제어/법률용어로만 작성한다.
+    """
+).strip()
+
+
 def build_user_prompt_law(
     clause_text: str,
+    issue_menu=None,
     extra_instructions: str | None = None,
 ) -> str:
+    hint = _hint_block(clause_text)
+    menu = _menu_block(issue_menu)
+    tail = "".join(f"\n\n{b}" for b in (menu, hint) if b)
     prompt = dedent(
         f"""
         다음 임대차 계약서 특약 조항을 법령 검색에 최적화된 ClauseQueryExpansion으로 변환하라.
@@ -130,14 +187,13 @@ def build_user_prompt_law(
         {clause_text}
 
         작성 지시:
-        - 출력은 순수 JSON 객체 하나만 생성한다.
-        - expansion_query는 섹션 라벨 없이 산문 2~3문장으로 작성한다(300자 이내).
-        - 입력 특약의 구체 사실(금액·날짜·조건·행위 주체)을 반드시 포함한다.
-        - 최종 법률 판단을 하지 말고 적용 법령 쟁점만 서술한다.
+        - 출력은 순수 JSON 객체 하나만 생성한다(expansion_query, legal_issues, keywords).
+        - legal_issues는 이 특약에 적용되는 법제도의 '표준 명칭'으로 1개 이상 반드시 채운다.
+        - expansion_query에는 입력 특약의 구체 사실(금액/날짜/조건/주체)을 포함한다.
 
         {LAW_STATUTE_LANGUAGE_GUIDE}
 
-        {LAW_PROMPT_APPEND}
+        {LAW_NAMING_APPEND}{tail}
         """
     ).strip()
     if extra_instructions:
