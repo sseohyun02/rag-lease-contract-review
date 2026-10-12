@@ -38,48 +38,37 @@ CLARA(Contract Lease Analysis and Review Assistant) 는 RAG 기술을 활용하�
 
 ## 시스템 아키텍처
 
-<table>
-  <thead>
-    <tr>
-      <th>전체 파이프라인</th>
-      <th>인프라 구조</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td valign="top">
-<pre>
-[계약서 PDF 업로드]
-       ↓
-[텍스트 추출 + 개인정보 마스킹]
-       ↓
-[특약 추출 + 쿼리 확장]
-       ↓
-[BM25 키워드 검색 / Dense 의미 검색]
-       ↓
-[하이브리드 검색 결과 결합]
-       ↓
-[검색된 법령·판례 내용 조회]
-       ↓
-[보고서 생성 (Gemini LLM)]
-</pre>
-      </td>
-      <td valign="top">
-<pre>
-[사용자 브라우저 (Next.js)]
-       ↓ HTTPS
-[Cloud Run (FastAPI 백엔드)]
-       ↓
-[Cloud SQL / Cloud Storage]
+### 전체 파이프라인
 
-Cloud SQL: 법령·판례 DB
-Cloud Storage: 계약서 파일
-</pre>
-      </td>
-    </tr>
-  </tbody>
-</table>
+```mermaid
+flowchart TD
+    A["계약서 PDF 업로드"] --> B["Document AI 텍스트 추출"]
+    B --> C["개인정보 마스킹 · 규칙 기반 특약 추출"]
+    C --> D["LLM 기반 쿼리 확장"]
 
+    D --> E["BM25 키워드 검색"]
+    D --> F["Dense 의미 검색"]
+    E --> G["법령·판례별 검색 결과 결합"]
+    F --> G
+
+    G --> H["검색된 법령·판례 내용 조회"]
+    H --> I["Gemini 특약별 분석"]
+    I --> J["특약 간 관계 분석 · 체크리스트 생성"]
+    C -->|공통특약 · 계약 정보| J
+```
+
+### 인프라 구조
+
+```mermaid
+flowchart TD
+    A["사용자 브라우저"] -->|화면 제공| B["Firebase Hosting<br/>Next.js 프론트엔드"]
+    A -->|HTTPS API 요청| C["Cloud Run<br/>FastAPI 백엔드"]
+
+    C -->|법령·판례 검색 및 문서 이력 관리| D[("Cloud SQL<br/>PostgreSQL · pgvector")]
+    C -->|PDF · 파싱 결과 저장 및 조회| E[("Cloud Storage")]
+    C -->|PDF 텍스트 추출| F["Document AI<br/>Layout Parser"]
+    C -->|쿼리 확장 · 임베딩 · 분석 생성| G["Vertex AI<br/>Gemini · Gemini Embedding"]
+```
 
 ## 기술 스택
 
